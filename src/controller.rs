@@ -149,6 +149,8 @@ pub struct Outcome {
 pub struct Controller {
     state: State,
     last_session: SessionId,
+    /// Copy/insert started automatically when a result becomes ready.
+    on_ready: Option<Action>,
 }
 
 impl Default for Controller {
@@ -159,9 +161,16 @@ impl Default for Controller {
 
 impl Controller {
     pub fn new() -> Self {
+        Self::with_on_ready(None)
+    }
+
+    /// A controller that starts `on_ready` itself whenever processing
+    /// produces a result (no deferred reply; nobody is waiting for one).
+    pub fn with_on_ready(on_ready: Option<Action>) -> Self {
         Self {
             state: State::Idle,
             last_session: 0,
+            on_ready,
         }
     }
 
@@ -302,13 +311,26 @@ impl Controller {
                     tracing::debug!(session, "ignoring stale processing result");
                     return out;
                 }
-                let next = match result {
-                    Ok(result) => State::Ready {
+                let next = match (result, self.on_ready) {
+                    (Ok(result), Some(action)) => {
+                        out.effects.push(Effect::Inject {
+                            session,
+                            action,
+                            text: result.text.clone(),
+                        });
+                        State::Inserting {
+                            session,
+                            result,
+                            action,
+                            raw: false,
+                        }
+                    }
+                    (Ok(result), None) => State::Ready {
                         session,
                         result,
                         notice: None,
                     },
-                    Err(message) => State::Error {
+                    (Err(message), _) => State::Error {
                         session: Some(session),
                         message,
                     },
@@ -738,6 +760,60 @@ mod tests {
         ready(&mut c, "same");
         let (_, o) = c.handle_command(Command::CopyRaw);
         assert!(matches!(&o.effects[..], [Effect::Inject { text, .. }] if text == "same"));
+    }
+
+    #[test]
+    fn on_ready_inserts_automatically() {
+        let mut c = Controller::with_on_ready(Some(Action::Insert));
+        run(&mut c, Command::Toggle);
+        run(&mut c, Command::Toggle);
+        let o = c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Ok(plain("hello")),
+        });
+        assert_eq!(
+            o.effects,
+            vec![Effect::Inject {
+                session: 1,
+                action: Action::Insert,
+                text: "hello".into()
+            }]
+        );
+        assert_eq!(kind(&c), StateKind::Inserting);
+
+        let o = c.handle_internal(Internal::InjectionFinished {
+            session: 1,
+            result: Ok(()),
+        });
+        assert_eq!(kind(&c), StateKind::Idle);
+        assert!(o.deferred_reply.unwrap().ok);
+
+        // A failed automatic insertion leaves the result ready for retry.
+        run(&mut c, Command::Toggle);
+        run(&mut c, Command::Toggle);
+        c.handle_internal(Internal::ProcessingFinished {
+            session: 2,
+            result: Ok(plain("again")),
+        });
+        c.handle_internal(Internal::InjectionFinished {
+            session: 2,
+            result: Err("no virtual keyboard".into()),
+        });
+        assert_eq!(kind(&c), StateKind::Ready);
+        let (reply, o) = c.handle_command(Command::Insert);
+        assert!(reply.is_none());
+        assert_eq!(o.effects.len(), 1);
+
+        // Errors are not inserted.
+        let mut c = Controller::with_on_ready(Some(Action::Copy));
+        run(&mut c, Command::Toggle);
+        run(&mut c, Command::Toggle);
+        let o = c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Err("no speech".into()),
+        });
+        assert!(o.effects.is_empty());
+        assert_eq!(kind(&c), StateKind::Error);
     }
 
     #[test]

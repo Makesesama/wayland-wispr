@@ -17,8 +17,8 @@ use crate::transcription::{
 use crate::ui::{UiEvent, View};
 use crate::{ipc, probe, ui};
 
-/// Covers copy/insert, which reply only after the paste chord was sent.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Covers copy/insert, which reply only after the text was typed/pasted.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum Msg {
     Command(Command, mpsc::SyncSender<Reply>),
@@ -27,7 +27,7 @@ enum Msg {
 
 pub fn run(config: Config) -> anyhow::Result<()> {
     check_capabilities()?;
-    let injector = Arc::new(Injector::new(&config.injection).context("preparing paste chord")?);
+    let injector = Arc::new(Injector::new(&config.injection).context("preparing text insertion")?);
     let transcriber = Arc::new(Transcriber::new(&config).context("setting up transcription")?);
     let cleaner = Arc::new(Cleaner::new(&config.cleanup).context("setting up cleanup")?);
 
@@ -117,7 +117,7 @@ struct Runtime {
 
 impl Runtime {
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
-        let mut controller = Controller::new();
+        let mut controller = Controller::with_on_ready(self.config.injection.on_ready.action());
         // Reply channel of the one copy/insert command awaiting completion.
         // The controller rejects further copy/insert commands until then.
         let mut pending: Option<mpsc::SyncSender<Reply>> = None;

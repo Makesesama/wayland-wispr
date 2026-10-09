@@ -24,13 +24,13 @@ cargo run -- probe            # which native protocols the compositor offers
 cargo run -- run              # resident process + overlay (needs wlr layer-shell)
 
 # from another terminal / a WM keybinding:
-wayland-wispr toggle          # start recording / stop and process
+wayland-wispr toggle          # start recording / stop, process, copy + type into focused field
 wayland-wispr start | stop    # push-to-talk press / release
 wayland-wispr cancel          # discard recording, processing, or ready result
 wayland-wispr status          # JSON state (never contains transcript text)
 wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
-wayland-wispr insert          # copy, then send the paste chord to the focused app
+wayland-wispr insert          # copy, then type (or paste) into the focused app
 wayland-wispr insert --raw    # same with the raw transcript (also `copy --raw`)
 wayland-wispr check-config    # validate the config, show which model it resolves to
 wayland-wispr bench <wav>     # measure the configured whisper model on this machine
@@ -52,7 +52,7 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0) |
 | `src/probe.rs` | Native `wayland-client` global probe on its own connection |
 | `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
-| `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` paste chord (`wayland-protocols-misc`) |
+| `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` direct typing and paste chord (`wayland-protocols-misc`) |
 | `src/transcription/` | Backend interface + cancellation; `whisper.rs`: whisper.cpp worker thread (lazy load, preload on record, idle unload, de/en-restricted language detection); `model.rs`: model resolution/validation |
 | `src/cleanup/` | LLM cleanup: blocking `ureq` client for streamed `/chat/completions` (cancellable, output-capped), built-in few-shot prompt (`prompt.toml`), reply sanitizing/guards with raw fallback, `cleanup`/`cleanup-eval` commands |
 | `src/bench.rs` | `bench` subcommand: load time, latency, RSS and VRAM per model/device |
@@ -140,13 +140,23 @@ Notes:
   `cleanup-eval`; `--model`, `--base-url`, `--reasoning-effort`, and
   `--prompt-file` override the config.
 
-**Insertion notes.** `copy` and `insert` replace your clipboard (no restoration).
-`insert` targets whatever is focused *when it runs* and reports success once the
-chord was delivered to the compositor — Wayland gives no acknowledgement that
-the app actually pasted. On failure the result stays ready for a manual retry;
-nothing is retried automatically. Terminals usually need
-`injection.paste_chord = "ctrl+shift+v"`. The paste uses a fixed US keymap on a
-short-lived virtual keyboard, independent of your layout.
+**Insertion notes.** By default (`injection.on_ready = "insert"`) the result
+is copied to the clipboard and then typed into whatever is focused *when
+processing finishes* — no extra command. Typing goes through
+`zwp_virtual_keyboard_v1` with a short-lived keymap per text that maps each
+character to a printable key position, so it works the same in editors,
+browsers, and terminals and is independent of your layout and of app paste
+shortcuts. Line breaks are typed as Shift+Return (`injection.newline`); in a
+terminal that may still run a command, so prefer `"space"` if you dictate into
+shells. Emoji/supplementary characters may not type in Chromium-based apps; the
+clipboard always has the exact text. `method = "paste"` sends `paste_chord`
+instead (terminals: `"ctrl+shift+v"`). `on_ready = "none"` restores the
+explicit flow: the result stays ready for `copy`/`insert`.
+
+The clipboard is replaced (no restoration). Success means the keys were
+delivered to the compositor — Wayland gives no acknowledgement that the app
+inserted them. On failure the result stays ready for a manual `insert`/`copy`;
+nothing is retried automatically.
 
 ## Nix
 
@@ -297,7 +307,7 @@ cargo run -- run
 
 # terminal 2: drive it (or bind these in fenster to the absolute
 # path of target/debug/wayland-wispr)
-cargo run -q -- toggle      # start; toggle again to stop → transcribes → Ready
+cargo run -q -- toggle      # start; toggle again to stop → transcribes → types into focus
 cargo run -q -- status
 cargo run -q -- insert      # focus your target window first, or use a keybinding
 cargo run -q -- copy

@@ -354,7 +354,10 @@ assumptions before investing in inference. All unchecked items are future work.
             balanced Ctrl+V with modifiers cleared).
       - [ ] Manual riverfx test: editor, browser, terminal (`ctrl+shift+v`),
             physical keyboard/modifiers afterwards.
-      - [ ] Direct Unicode typing spike (optional).
+      - [x] Direct Unicode typing (`injection.method = "type"`, default):
+            per-text keymaps on 48 printable evdev positions (wtype#77),
+            batched keymap switches, Shift+Return newlines; auto-insert after
+            processing via `injection.on_ready`. Needs a manual riverfx check.
 
 **Acceptance:** `cargo run -- run` shows a controllable indicator on riverfx;
 an editor retains focus and typed input while it changes state. Check using a

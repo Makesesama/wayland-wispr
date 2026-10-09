@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::injection::Action;
+pub use crate::injection::typing::Newline;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("could not read config {path}")]
@@ -292,22 +295,67 @@ pub fn is_loopback_host(host: &str) -> bool {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct InjectionConfig {
-    /// Chord sent after copying, e.g. `ctrl+v`, `ctrl+shift+v`, `shift+Insert`.
+    /// What happens automatically once a result is ready.
+    pub on_ready: OnReady,
+    /// How `insert` puts the text into the focused application. The text
+    /// is always copied to the clipboard first.
+    pub method: InsertMethod,
+    /// With `method = "type"`: how line breaks are typed.
+    pub newline: Newline,
+    /// With `method = "type"`: pause after each typed character.
+    pub type_delay_ms: u64,
+    /// With `method = "paste"`: chord sent after copying, e.g. `ctrl+v`,
+    /// `ctrl+shift+v`, `shift+Insert`.
     pub paste_chord: String,
-    /// Delay before the paste chord, so the triggering keybinding is released.
+    /// Delay before typing/pasting, so the triggering keybinding is released.
     pub pre_insert_delay_ms: u64,
-    /// Delay between synthetic key events.
+    /// Delay after keymap changes and while a paste chord is held.
     pub key_delay_ms: u64,
 }
 
 impl Default for InjectionConfig {
     fn default() -> Self {
         Self {
+            on_ready: OnReady::Insert,
+            method: InsertMethod::Type,
+            newline: Newline::ShiftEnter,
+            type_delay_ms: 2,
             paste_chord: "ctrl+v".into(),
             pre_insert_delay_ms: 150,
             key_delay_ms: 10,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OnReady {
+    /// Copy, then type/paste into whatever is focused when processing ends.
+    Insert,
+    /// Only copy to the clipboard.
+    Copy,
+    /// Keep the result ready for an explicit `copy`/`insert`.
+    None,
+}
+
+impl OnReady {
+    pub fn action(self) -> Option<Action> {
+        match self {
+            OnReady::Insert => Some(Action::Insert),
+            OnReady::Copy => Some(Action::Copy),
+            OnReady::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InsertMethod {
+    /// Type the text through the virtual keyboard; works regardless of an
+    /// application's paste shortcut.
+    Type,
+    /// Send `paste_chord` and let the application paste the clipboard.
+    Paste,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -401,6 +449,11 @@ impl Config {
         if self.injection.pre_insert_delay_ms > 5000 || self.injection.key_delay_ms > 500 {
             return Err(ConfigError::Invalid(
                 "injection delays must be at most 5000 ms (pre-insert) and 500 ms (per key)".into(),
+            ));
+        }
+        if self.injection.type_delay_ms > 100 {
+            return Err(ConfigError::Invalid(
+                "injection.type_delay_ms must be at most 100".into(),
             ));
         }
         if !self.audio.host.eq_ignore_ascii_case("auto")
@@ -584,6 +637,16 @@ mod tests {
         assert!(c.validate().is_err());
         let c: Config = toml::from_str("[injection]\npaste_chord = \"ctrl+shift+v\"").unwrap();
         c.validate().unwrap();
+        let c: Config = toml::from_str(
+            "[injection]\non_ready = \"none\"\nmethod = \"paste\"\nnewline = \"space\"",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.injection.on_ready.action(), None);
+        assert_eq!(c.injection.newline, Newline::Space);
+        assert!(toml::from_str::<Config>("[injection]\nmethod = \"wtype\"").is_err());
+        let c: Config = toml::from_str("[injection]\ntype_delay_ms = 1000").unwrap();
+        assert!(c.validate().is_err());
     }
 
     #[test]

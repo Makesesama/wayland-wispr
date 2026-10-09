@@ -53,7 +53,7 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Copy the ready result and send the paste chord to the focused application.
+    /// Copy the ready result and type it (or send the paste chord) into the focused application.
     Insert {
         /// Use the raw transcript instead of the LLM-cleaned text.
         #[arg(long)]

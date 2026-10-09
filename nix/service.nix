@@ -6,7 +6,7 @@
 #     settings.transcription.whisper.model = "small-q5_1"; # fetched automatically
 #   };
 #
-# Bind `wayland-wispr toggle` (and `insert`, `cancel`, …) in the window manager.
+# Bind `wayland-wispr toggle` (and `cancel`, …) in the window manager.
 {
   config,
   lib,
@@ -75,7 +75,7 @@ in
             beam_size = 5;
           };
           cleanup.model = "qwen2.5:7b-instruct";
-          injection.paste_chord = "ctrl+shift+v";
+          injection.newline = "space";
         }
       '';
       description = ''

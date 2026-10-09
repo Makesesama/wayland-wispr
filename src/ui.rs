@@ -10,7 +10,7 @@ use gtk4::{gdk, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::cleanup::CleanupStatus;
-use crate::config::{Config, OverlayLayer};
+use crate::config::{Config, InsertMethod, OverlayLayer};
 use crate::controller::{SessionId, State};
 use crate::injection::Action;
 
@@ -120,6 +120,7 @@ struct Overlay {
     recording_since: Cell<Option<Instant>>,
     recording_session: Cell<Option<SessionId>>,
     processing_session: Cell<Option<SessionId>>,
+    insert_label: &'static str,
 }
 
 impl Overlay {
@@ -178,6 +179,10 @@ impl Overlay {
             recording_since: Cell::new(None),
             recording_session: Cell::new(None),
             processing_session: Cell::new(None),
+            insert_label: match config.injection.method {
+                InsertMethod::Type => "Typing…",
+                InsertMethod::Paste => "Pasting…",
+            },
         }
     }
 
@@ -221,7 +226,7 @@ impl Overlay {
             } => ("processing", "Copying…", String::new()),
             View::Inserting {
                 action: Action::Insert,
-            } => ("processing", "Pasting…", String::new()),
+            } => ("processing", self.insert_label, String::new()),
             View::Error { message } => ("error", "Error", message.clone()),
         };
         self.pill.add_css_class(class);

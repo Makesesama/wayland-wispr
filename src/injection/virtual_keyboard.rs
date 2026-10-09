@@ -1,5 +1,5 @@
-//! Native `zwp_virtual_keyboard_v1` chord emission on a private Wayland
-//! connection (never GTK's).
+//! Native `zwp_virtual_keyboard_v1` key emission (paste chords and direct
+//! typing) on a private Wayland connection (never GTK's).
 
 use std::fs::File;
 use std::io::Write;
@@ -44,8 +44,51 @@ fn err(context: &str, e: impl std::fmt::Display) -> String {
     format!("virtual keyboard: {context}: {e}")
 }
 
-/// Press and release `plan`'s chord once on a new virtual keyboard.
-pub fn send_chord(plan: &ChordPlan, key_delay: Duration) -> Result<(), String> {
+/// One keymap plus the keys to press with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch {
+    /// NUL-terminated XKB text keymap.
+    pub keymap: Vec<u8>,
+    pub strokes: Vec<Stroke>,
+}
+
+/// One key press and release with a depressed-modifier mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stroke {
+    /// Wire keycode (evdev = XKB keycode - 8).
+    pub key: u32,
+    /// Depressed modifiers in the batch's keymap.
+    pub mods: u32,
+}
+
+impl From<&ChordPlan> for Batch {
+    fn from(plan: &ChordPlan) -> Self {
+        Self {
+            keymap: plan.keymap.clone(),
+            strokes: vec![Stroke {
+                key: plan.key,
+                mods: plan.mods,
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// Pause after uploading a keymap and after the final release.
+    pub settle: Duration,
+    /// How long each key is held.
+    pub hold: Duration,
+    /// Pause after each key release.
+    pub gap: Duration,
+}
+
+/// Press and release every stroke of every batch, in order, on a new
+/// virtual keyboard.
+pub fn send(batches: &[Batch], timing: Timing) -> Result<(), String> {
+    if batches.is_empty() {
+        return Ok(());
+    }
     let conn = Connection::connect_to_env().map_err(|e| err("connect", e))?;
     let (globals, mut queue) =
         registry_queue_init::<State>(&conn).map_err(|e| err("registry", e))?;
@@ -65,42 +108,62 @@ pub fn send_chord(plan: &ChordPlan, key_delay: Duration) -> Result<(), String> {
         .map_err(|e| err("zwp_virtual_keyboard_manager_v1", e))?;
 
     let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
-    let keymap = keymap_fd(&plan.keymap).map_err(|e| err("keymap memfd", e))?;
-    keyboard.keymap(
-        xkb::KEYMAP_FORMAT_TEXT_V1,
-        keymap.as_fd(),
-        plan.keymap.len() as u32,
-    );
-    roundtrip(&mut queue, "keymap upload")?;
-    thread::sleep(key_delay);
-
-    let result = press_chord(&keyboard, &mut queue, plan, key_delay);
+    let mut held = None;
+    let result = press_all(&keyboard, &mut queue, batches, timing, &mut held);
 
     // Always leave the virtual keyboard with nothing held, even if a step
     // above failed. Errors here are secondary to `result`.
-    keyboard.key(timestamp(), plan.key, KEY_RELEASED);
+    if let Some(key) = held {
+        keyboard.key(timestamp(), key, KEY_RELEASED);
+    }
     keyboard.modifiers(0, 0, 0, 0);
     let release = roundtrip(&mut queue, "release");
-    thread::sleep(key_delay);
+    thread::sleep(timing.settle);
     keyboard.destroy();
     let _ = conn.flush();
 
     result.and(release)
 }
 
-fn press_chord(
+fn press_all(
     keyboard: &ZwpVirtualKeyboardV1,
     queue: &mut EventQueue<State>,
-    plan: &ChordPlan,
-    key_delay: Duration,
+    batches: &[Batch],
+    timing: Timing,
+    held: &mut Option<u32>,
 ) -> Result<(), String> {
-    keyboard.modifiers(plan.mods, 0, 0, 0);
-    roundtrip(queue, "modifiers")?;
-    keyboard.key(timestamp(), plan.key, KEY_PRESSED);
-    roundtrip(queue, "key press")?;
-    thread::sleep(key_delay);
-    keyboard.key(timestamp(), plan.key, KEY_RELEASED);
-    roundtrip(queue, "key release")?;
+    for batch in batches {
+        // Keymaps are only switched with every key released.
+        let keymap = keymap_fd(&batch.keymap).map_err(|e| err("keymap memfd", e))?;
+        keyboard.keymap(
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            keymap.as_fd(),
+            batch.keymap.len() as u32,
+        );
+        roundtrip(queue, "keymap upload")?;
+        thread::sleep(timing.settle);
+
+        // Start each keymap from a known modifier state (nothing locked).
+        let mut mods = None;
+        for stroke in &batch.strokes {
+            if mods != Some(stroke.mods) {
+                keyboard.modifiers(stroke.mods, 0, 0, 0);
+                mods = Some(stroke.mods);
+            }
+            keyboard.key(timestamp(), stroke.key, KEY_PRESSED);
+            *held = Some(stroke.key);
+            roundtrip(queue, "key press")?;
+            thread::sleep(timing.hold);
+            keyboard.key(timestamp(), stroke.key, KEY_RELEASED);
+            *held = None;
+            roundtrip(queue, "key release")?;
+            thread::sleep(timing.gap);
+        }
+        if mods != Some(0) {
+            keyboard.modifiers(0, 0, 0, 0);
+            roundtrip(queue, "modifiers")?;
+        }
+    }
     Ok(())
 }
 
