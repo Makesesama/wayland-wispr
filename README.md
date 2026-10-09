@@ -75,7 +75,7 @@ The flake supports `x86_64-linux` and `aarch64-linux`. It provides:
 ### Try it
 
 ```sh
-flake=git+ssh://git@github.com/Makesesama/wayland-wispr.git
+flake=github:Makesesama/wayland-wispr
 nix run $flake -- probe     # does the compositor support everything?
 
 # the app never downloads models; fetch the default one with Nix (or curl)
@@ -92,7 +92,7 @@ nix run $flake -- toggle    # terminal 2: start, speak, run again to stop
 ```nix
 # flake.nix
 inputs.wayland-wispr = {
-  url = "git+ssh://git@github.com/Makesesama/wayland-wispr.git";
+  url = "github:Makesesama/wayland-wispr";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 ```
