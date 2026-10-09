@@ -481,6 +481,7 @@ Unknown keys are errors. Relative paths are relative to the config file. Only
 | Key | Default | Description |
 | --- | --- | --- |
 | `max_seconds` | `120` | Recording stops automatically after this many seconds (1–3600) |
+| `pause_media` | `true` | Pause media players (MPRIS) that are playing while recording. They resume once the microphone is closed. Players that were already paused stay paused. |
 
 ### `[audio]`
 

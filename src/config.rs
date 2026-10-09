@@ -184,11 +184,17 @@ pub enum OverlayLayer {
 pub struct RecordingConfig {
     /// Recording is stopped automatically after this many seconds.
     pub max_seconds: u64,
+    /// Pause playing MPRIS media players while recording and resume them
+    /// once the microphone is closed.
+    pub pause_media: bool,
 }
 
 impl Default for RecordingConfig {
     fn default() -> Self {
-        Self { max_seconds: 120 }
+        Self {
+            max_seconds: 120,
+            pause_media: true,
+        }
     }
 }
 

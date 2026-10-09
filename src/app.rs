@@ -11,6 +11,7 @@ use crate::cleanup::{Cleaner, Processed};
 use crate::config::Config;
 use crate::controller::{Action, Command, Controller, Effect, Internal, Reply, SessionId};
 use crate::injection::Injector;
+use crate::media::Media;
 use crate::note::{self, NoteHook};
 use crate::transcription::{
     CancelFlag, Progress, TranscribeError, Transcriber, strip_hallucinations,
@@ -60,6 +61,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                 transcriber,
                 cleaner,
                 note_hook,
+                media: Media::new(config.recording.pause_media),
                 capture: None,
                 processing: None,
                 delivering: None,
@@ -123,6 +125,8 @@ struct Runtime {
     transcriber: Arc<Transcriber>,
     cleaner: Arc<Cleaner>,
     note_hook: Option<Arc<NoteHook>>,
+    /// Pauses media players while recording.
+    media: Media,
     /// The microphone capture of the current recording session, if any.
     capture: Option<(SessionId, Capture)>,
     /// Cancellation handle of the session being processed, if any.
@@ -178,6 +182,8 @@ impl Runtime {
     fn execute(&mut self, effect: Effect) {
         match effect {
             Effect::StartCapture { session } => {
+                // Async: neither waits for the other.
+                self.media.pause();
                 let tx = self.tx.clone();
                 let ui = self.ui.clone();
                 let capture = Capture::start(
@@ -202,6 +208,7 @@ impl Runtime {
             Effect::DiscardCapture { session } => {
                 if self.capture.as_ref().is_some_and(|(s, _)| *s == session) {
                     self.capture = None; // Drop cancels without blocking.
+                    self.media.resume();
                 }
             }
             Effect::ScheduleRecordingLimit { session } => {
@@ -225,17 +232,20 @@ impl Runtime {
                 let cancel = CancelFlag::default();
                 self.processing = Some((session, cancel.clone()));
                 let ui = self.ui.clone();
-                self.spawn("process", move || Internal::ProcessingFinished {
-                    session,
-                    result: process(
+                let media = self.media.clone();
+                self.spawn("process", move || {
+                    let raw = capture
+                        .ok_or_else(|| "no recording for this session".to_owned())
+                        .and_then(Capture::finish);
+                    // The microphone is closed, so playback cannot leak into
+                    // the recording. No need to wait for transcription.
+                    media.resume();
+                    Internal::ProcessingFinished {
                         session,
-                        capture,
-                        &config,
-                        &transcriber,
-                        &cleaner,
-                        &cancel,
-                        ui,
-                    ),
+                        result: raw.and_then(|raw| {
+                            process(session, &raw, &config, &transcriber, &cleaner, &cancel, ui)
+                        }),
+                    }
                 });
             }
             Effect::AbortProcessing { session } => {
@@ -303,21 +313,18 @@ impl Runtime {
     }
 }
 
-/// Stop the capture, normalize the audio, transcribe it, and clean up the
+/// Normalize the recorded audio, transcribe it, and clean up the
 /// transcript. Blocking; runs on a worker thread.
 fn process(
     session: SessionId,
-    capture: Option<Capture>,
+    raw: &audio::Clip,
     config: &Config,
     transcriber: &Transcriber,
     cleaner: &Cleaner,
     cancel: &CancelFlag,
     ui: async_channel::Sender<UiEvent>,
 ) -> Result<Processed, String> {
-    let capture = capture.ok_or("no recording for this session")?;
-    let raw = capture.finish()?;
-
-    let clip = audio::prepare(&raw, &config.audio, |clip| {
+    let clip = audio::prepare(raw, &config.audio, |clip| {
         if let Some(dir) = &config.debug.save_recordings_dir {
             match audio::save_debug_wav(dir, session, clip) {
                 Ok(path) => tracing::info!(path = %path.display(), "saved debug recording"),

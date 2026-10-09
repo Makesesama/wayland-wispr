@@ -276,6 +276,13 @@ Stage failure → Error (with recoverable transcript/result where available)
   a Ready result replies immediately instead of deferring, so a slow hook
   never blocks the control socket. Hook stderr is overlay-only detail
   (`Failure::detail`), never part of `status`.
+- Media pausing (`src/media.rs`, `recording.pause_media`): `StartCapture`
+  pauses MPRIS players that are playing. They are resumed right after the
+  microphone closes (in the process worker, before transcription) or on
+  `DiscardCapture`. A dedicated thread makes the gio D-Bus calls, one request
+  at a time, so they never delay the overlay or capture start. Players are
+  tracked by unique bus name and resumed only if still paused. playerctld is
+  skipped because it only mirrors other players. Every failure is ignored.
 - On shutdown: stop capture, cancel workers, close IPC, remove only the socket
   owned by this process, and release transient audio/text buffers.
 

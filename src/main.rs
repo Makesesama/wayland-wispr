@@ -7,6 +7,7 @@ mod config;
 mod controller;
 mod injection;
 mod ipc;
+mod media;
 mod note;
 mod probe;
 mod theme;

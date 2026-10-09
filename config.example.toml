@@ -22,6 +22,7 @@ opacity = 0.88        # pill background (0 = transparent, 1 = opaque); text stay
 
 [recording]
 max_seconds = 120   # recording stops automatically after this
+pause_media = true  # pause playing media players (MPRIS) while recording
 
 [audio]
 host = "auto"                  # PipeWire if available, else ALSA; or "pipewire" / "alsa"
