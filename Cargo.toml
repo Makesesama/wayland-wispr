@@ -1,0 +1,34 @@
+[package]
+name = "wayland-wispr"
+version = "0.1.0"
+edition = "2024"
+description = "Wayland-native dictation overlay"
+license = "MIT"
+publish = false
+
+[dependencies]
+# GTK4 0.11 and gtk4-layer-shell 0.8 both target the gtk-rs 0.22 (glib) line.
+gtk4 = { version = "0.11", features = ["v4_12"] }
+glib-unix = "0.22"
+gtk4-layer-shell = "0.8"
+async-channel = "2.5"
+
+# Native Wayland protocol access on a separate connection (pure-Rust backend,
+# so it does not interfere with gtk4-layer-shell's libwayland link order).
+wayland-client = "0.31"
+
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+rustix = { version = "1.1", features = ["net", "process", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

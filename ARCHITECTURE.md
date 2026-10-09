@@ -2,8 +2,8 @@
 
 ## Status and goal
 
-**Status:** planning document. Only the Nix development environment exists;
-none of the application modules, commands, or configuration below are implemented.
+**Status:** Phase 1 skeleton plus Phase 2 controller/IPC exist (see checklist).
+Audio, transcription, cleanup, and insertion modules below are still planned.
 
 See [RESEARCH.md](RESEARCH.md) for native-library research, source links, and
 remaining uncertainties. Runtime subprocess helpers and X11/uinput compatibility
@@ -335,10 +335,11 @@ assumptions before investing in inference. All unchecked items are future work.
 
 ### Phase 1 — Cargo skeleton and overlay
 
-- [ ] Create Cargo package with compatible GTK4/layer-shell crate versions.
-- [ ] Add `run`, logging, and fake Idle/Recording/Processing/Ready state changes.
-- [ ] Implement the bottom-center indicator, keyboard mode None, exclusive zone zero.
-- [ ] Probe layer-shell support and add clear unsupported behavior.
+- [x] Create Cargo package with compatible GTK4/layer-shell crate versions
+      (`gtk4` 0.11 + `gtk4-layer-shell` 0.8, both on the gtk-rs/glib 0.22 line).
+- [x] Add `run`, logging, and fake Idle/Recording/Processing/Ready state changes.
+- [x] Implement the bottom-center indicator, keyboard mode None, exclusive zone zero.
+- [x] Probe layer-shell support and add clear unsupported behavior (`probe` command).
 - [ ] Complete a native insertion spike: data-control ownership without focus,
       virtual-keyboard paste in editor/browser/terminal, and physical modifier
       cleanup. Evaluate direct Unicode typing separately; record actual riverfx
@@ -350,8 +351,8 @@ real compositor session, not just compilation.
 
 ### Phase 2 — Controller and local IPC
 
-- [ ] Implement state transitions/session IDs with unit tests.
-- [ ] Add bounded Unix socket protocol, single-instance handling, and CLI controls.
+- [x] Implement state transitions/session IDs with unit tests.
+- [x] Add bounded Unix socket protocol, single-instance handling, and CLI controls.
 - [ ] Document example WM keybindings without editing sibling/system configs.
 - [ ] Test cancellation, invalid commands, and repeated/rapid toggles.
 

@@ -1,0 +1,11 @@
+# Copy to $XDG_CONFIG_HOME/wayland-wispr/config.toml. All keys are optional.
+
+[overlay]
+layer = "overlay"   # or "top"
+margin_bottom = 48  # logical pixels from the bottom edge
+
+[recording]
+max_seconds = 120   # recording stops automatically after this
+
+[debug]
+fake_processing_ms = 1500  # placeholder processing delay until real backends exist

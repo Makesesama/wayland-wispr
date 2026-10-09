@@ -2,13 +2,46 @@
 
 A planned Wayland dictation overlay: record speech, transcribe locally or through
 an OpenAI-compatible API, optionally polish with an LLM, then insert the result
-into the active application. This repository currently contains only the
-development environment, not an application or a Nix app package.
+into the active application.
+
+**Status:** early skeleton. The resident process, layer-shell overlay, control
+socket, session state machine, and Wayland capability probe work. Audio capture,
+transcription, cleanup, and clipboard/insertion are **not implemented yet** —
+stopping a recording produces a placeholder transcript. No Nix app package yet.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
 Wayland constraints, and phased implementation checklist with acceptance criteria.
 [RESEARCH.md](RESEARCH.md) compares native HTTP/SDK, local Whisper/VRAM, and
 clipboard/virtual-keyboard options with source links.
+
+## Usage
+
+```sh
+cargo run -- probe            # which native protocols the compositor offers
+cargo run -- run              # resident process + overlay (needs wlr layer-shell)
+
+# from another terminal / a WM keybinding:
+wayland-wispr toggle          # start recording / stop and process
+wayland-wispr start | stop    # push-to-talk press / release
+wayland-wispr cancel          # discard recording, processing, or ready result
+wayland-wispr status          # JSON state (never contains transcript text)
+wayland-wispr copy | insert   # placeholders: not implemented yet
+```
+
+The control socket is `$XDG_RUNTIME_DIR/wayland-wispr/control.sock` (private
+directory, same-UID peers only). Logging uses `RUST_LOG` (default `info`).
+Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
+[config.example.toml](config.example.toml).
+
+| Module | Purpose |
+| --- | --- |
+| `src/main.rs` | CLI (`clap`) |
+| `src/app.rs` | Resident process: controller thread, IPC thread, effect workers |
+| `src/controller.rs` | Pure session state machine with session IDs (unit-tested) |
+| `src/ipc.rs` | Versioned, size-bounded JSON-line Unix socket protocol |
+| `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0) |
+| `src/probe.rs` | Native `wayland-client` global probe on its own connection |
+| `src/config.rs` | TOML settings with validation |
 
 ## Development
 
