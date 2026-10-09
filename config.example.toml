@@ -10,6 +10,15 @@ margin = 48           # logical pixels from the anchored edge(s)
 # output = "DP-1"     # connector name; default: the compositor chooses
 scale = 1.0           # size of the pill (0.5-4); margins are not scaled
 opacity = 0.88        # pill background (0 = transparent, 1 = opaque); text stays opaque
+# Custom GTK CSS layered over the built-in default theme; it can override any
+# rule (`wayland-wispr default-theme` prints the built-in one as a template).
+# Relative paths are relative to this file; a missing file falls back to the
+# default. Either one stylesheet:
+# theme = "theme.css"
+# or light/dark variants, switched live by darkman (else the XDG portal's
+# color-scheme; dark when neither is available). An omitted variant uses the
+# default theme. Example light theme: themes/light.css in the repo.
+# theme = { light = "light.css", dark = "dark.css" }
 
 [recording]
 max_seconds = 120   # recording stops automatically after this

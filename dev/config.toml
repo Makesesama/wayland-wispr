@@ -7,6 +7,9 @@ layer = "overlay"
 position = "bottom"
 margin = 48
 
+[overlay.theme]
+light = "../themes/light.css"
+
 [recording]
 max_seconds = 120
 

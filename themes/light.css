@@ -1,0 +1,42 @@
+/* Example light theme for wayland-wispr, e.g. with darkman:
+ *
+ *   [overlay.theme]
+ *   light = "/path/to/themes/light.css"   # dark: omitted = built-in default
+ *
+ * Loaded above the built-in stylesheet (`wayland-wispr default-theme`), so
+ * every property set here wins over it for the elements it matches, whatever
+ * the selector specificity. That is why the state colours are restated: a
+ * plain `.dot` rule would also replace the recording/processing/... colours.
+ * Sizes come from the built-in stylesheet (overlay.scale); this only recolours.
+ * The background alpha here replaces overlay.opacity.
+ *
+ * A light pill disappears on light windows, so it gets a hairline outline and
+ * a drop shadow. The layer surface is exactly as large as its content, so the
+ * window padding makes room for the shadow; it is transparent and
+ * click-through, but adds to overlay.margin on anchored edges (lower margin
+ * by the same amount to keep the pill where it was).
+ */
+
+window.wispr { padding: 16px; }
+
+.pill {
+  background-color: rgba(246, 246, 248, 0.92);
+  color: #1c1c21;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.10),
+              0 3px 10px rgba(0, 0, 0, 0.25);
+}
+
+.dot { background-color: #1c1c21; }
+.recording .dot { background-color: #e0302b; }
+.processing .dot { background-color: #c98a00; }
+.ready .dot { background-color: #1e9e5a; }
+.error .dot { background-color: #e0561b; }
+
+.step.pending { background-color: rgba(0, 0, 0, 0.15); }
+.step.done { background-color: rgba(28, 28, 33, 0.8); }
+.step.active { background-color: #c98a00; }
+.ready .step.done { background-color: #1e9e5a; }
+
+spinner.busy { color: #c98a00; }
+/* The waveform bars are drawn in this colour. */
+.wave { color: #e0302b; }

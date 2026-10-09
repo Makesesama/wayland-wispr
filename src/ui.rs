@@ -14,6 +14,7 @@ use crate::cleanup::CleanupStatus;
 use crate::config::{Config, InsertMethod, OnReady, OverlayConfig, OverlayLayer, Side};
 use crate::controller::{SessionId, State};
 use crate::injection::Action;
+use crate::theme;
 
 const APP_ID: &str = "de.makussu.WaylandWispr";
 const PREVIEW_CHARS: usize = 60;
@@ -34,9 +35,10 @@ const FADE: Duration = Duration::from_millis(160);
 /// How long "Inserted"/"Copied" stays up after a successful insert or copy.
 const CONFIRM: Duration = Duration::from_millis(900);
 
-/// Stylesheet with all sizes multiplied by `scale` and the pill background at
-/// `opacity`.
-fn css(scale: f64, opacity: f64) -> String {
+/// Built-in stylesheet (the default theme) with all sizes multiplied by
+/// `scale` and the pill background at `opacity`. A custom `overlay.theme` is
+/// layered on top; `wayland-wispr default-theme` prints this as a template.
+pub fn css(scale: f64, opacity: f64) -> String {
     let px = |v: f64| format!("{}px", (v * scale).round());
     let font = (scale * 100.0).round();
     format!(
@@ -50,6 +52,7 @@ window.wispr {{
   border-radius: 999px;
   padding: {pad_y} {pad_x};
   font-size: {font}%;
+  transition: background-color 200ms ease, color 200ms ease;
 }}
 .dot {{
   min-width: {dot};
@@ -840,6 +843,9 @@ pub fn run(config: Config, events: async_channel::Receiver<UiEvent>) -> bool {
             }
 
             install_css(config.overlay.scale, config.overlay.opacity);
+            // Before building the overlay: the pill's fixed width is measured
+            // with the stylesheets active at that point.
+            theme::install(config.overlay.theme.as_ref());
             *hold.borrow_mut() = Some(app.hold());
 
             let overlay = Overlay::new(app, &config);

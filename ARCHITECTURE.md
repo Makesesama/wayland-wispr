@@ -58,6 +58,13 @@ The resident process owns a GTK application and a small layer-shell window:
   once at startup. Only Ready/Error may grow, for their preview/message.
   `overlay.scale` multiplies all CSS sizes and the waveform geometry;
   `overlay.opacity` sets only the pill background's alpha.
+- Theming: the built-in stylesheet is the single default theme. `overlay.theme`
+  adds a user CSS provider one priority step above it (GTK's cascade lets the
+  higher provider win per property regardless of specificity). The value is
+  either one file or `light`/`dark` variants. Variants follow darkman's D-Bus
+  `Mode`/`ModeChanged` (name-watched, not auto-started), else the portal
+  `color-scheme`, else dark. They are watched with gio on the GTK main thread
+  and swapped by reloading the provider.
 - Placement is configurable: `overlay.position` (nine-point anchor), `margin`/
   `margin_x`/`margin_y`, and `output` (connector name, resolved before each show).
 - The overlay is click-through (empty input region) and has no buttons; aborting

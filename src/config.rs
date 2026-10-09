@@ -56,6 +56,8 @@ pub struct OverlayConfig {
     /// Opacity of the pill background (0 = transparent, 1 = opaque); text
     /// and indicators stay fully opaque.
     pub opacity: f64,
+    /// Custom stylesheet(s) layered over the built-in default theme.
+    pub theme: Option<ThemeConfig>,
 }
 
 impl Default for OverlayConfig {
@@ -69,6 +71,7 @@ impl Default for OverlayConfig {
             output: None,
             scale: 1.0,
             opacity: 0.88,
+            theme: None,
         }
     }
 }
@@ -121,6 +124,49 @@ impl OverlayPosition {
             BottomLeft => (Start, End),
             Bottom => (Middle, End),
             BottomRight => (End, End),
+        }
+    }
+}
+
+/// GTK CSS loaded above the built-in stylesheet, so any of its rules can be
+/// overridden. Relative paths are resolved against the config file's directory.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(
+    untagged,
+    expecting = "a stylesheet path, or a table with `light` and `dark` stylesheet paths"
+)]
+pub enum ThemeConfig {
+    /// One stylesheet, always used.
+    Single(PathBuf),
+    /// Switched by darkman's mode (else the portal's `color-scheme`; dark
+    /// when neither says). An omitted variant uses just the default theme.
+    Variants(ThemeVariants),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeVariants {
+    pub light: Option<PathBuf>,
+    pub dark: Option<PathBuf>,
+}
+
+impl ThemeConfig {
+    /// Every stylesheet path, for resolving and checking.
+    pub fn paths_mut(&mut self) -> Vec<&mut PathBuf> {
+        match self {
+            ThemeConfig::Single(path) => vec![path],
+            ThemeConfig::Variants(v) => [&mut v.light, &mut v.dark].into_iter().flatten().collect(),
+        }
+    }
+
+    pub fn paths(&self) -> Vec<&Path> {
+        match self {
+            ThemeConfig::Single(path) => vec![path],
+            ThemeConfig::Variants(v) => [&v.light, &v.dark]
+                .into_iter()
+                .flatten()
+                .map(PathBuf::as_path)
+                .collect(),
         }
     }
 }
@@ -480,15 +526,23 @@ impl Config {
         config.validate()?;
         let base = path.parent().unwrap_or(Path::new("."));
         let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
-        for dir in [
+        let theme_paths = config
+            .overlay
+            .theme
+            .as_mut()
+            .map(ThemeConfig::paths_mut)
+            .unwrap_or_default();
+        for p in [
             &mut config.debug.save_recordings_dir,
             &mut config.transcription.whisper.models_dir,
             &mut config.transcription.whisper.model_path,
             &mut config.cleanup.prompt_file,
-        ] {
-            if let Some(p) = dir
-                && p.is_relative()
-            {
+        ]
+        .into_iter()
+        .flatten()
+        .chain(theme_paths)
+        {
+            if p.is_relative() {
                 *p = base.join(&*p);
             }
         }
@@ -525,6 +579,19 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "overlay.opacity must be between 0 and 1".into(),
             ));
+        }
+        if let Some(theme) = &self.overlay.theme {
+            let paths = theme.paths();
+            if paths.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "overlay.theme needs `light` and/or `dark`".into(),
+                ));
+            }
+            if paths.iter().any(|p| p.as_os_str().is_empty()) {
+                return Err(ConfigError::Invalid(
+                    "overlay.theme paths must not be empty".into(),
+                ));
+            }
         }
         if self.overlay.output.as_deref().is_some_and(str::is_empty) {
             return Err(ConfigError::Invalid(
@@ -744,6 +811,8 @@ mod tests {
         c.validate().unwrap();
         let c: Config = toml::from_str("[overlay]\nopacity = 0").unwrap();
         c.validate().unwrap();
+        let c: Config = toml::from_str("[overlay]\ntheme = \"\"").unwrap();
+        assert!(c.validate().is_err());
         for bad in ["-0.1", "1.5", "nan"] {
             let c: Config = toml::from_str(&format!("[overlay]\nopacity = {bad}")).unwrap();
             assert!(c.validate().is_err(), "opacity = {bad}");
@@ -804,6 +873,46 @@ mod tests {
         std::fs::write(&path, "[debug]\nsave_recordings_dir = \"rec\"").unwrap();
         let c = Config::load(Some(&path)).unwrap();
         assert_eq!(c.debug.save_recordings_dir, Some(dir.path().join("rec")));
+    }
+
+    #[test]
+    fn parses_and_resolves_themes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[overlay]\ntheme = \"theme.css\"").unwrap();
+        let c = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            c.overlay.theme,
+            Some(ThemeConfig::Single(dir.path().join("theme.css")))
+        );
+
+        std::fs::write(
+            &path,
+            "[overlay.theme]\nlight = \"light.css\"\ndark = \"/abs/dark.css\"",
+        )
+        .unwrap();
+        let c = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            c.overlay.theme,
+            Some(ThemeConfig::Variants(ThemeVariants {
+                light: Some(dir.path().join("light.css")),
+                dark: Some("/abs/dark.css".into()),
+            }))
+        );
+
+        // One variant is enough; the other mode uses the default theme.
+        let c: Config = toml::from_str("[overlay.theme]\nlight = \"l.css\"").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.overlay.theme.unwrap().paths(), [Path::new("l.css")]);
+        let c: Config = toml::from_str("[overlay.theme]").unwrap();
+        assert!(c.validate().is_err());
+
+        for bad in [
+            "[overlay.theme]\nlight = \"l.css\"\nfoo = 1",
+            "[overlay]\ntheme = 1",
+        ] {
+            assert!(toml::from_str::<Config>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -32,7 +32,8 @@ wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
 wayland-wispr insert          # copy, then type (or paste) into the focused app
 wayland-wispr insert --raw    # same with the raw transcript (also `copy --raw`)
-wayland-wispr check-config    # validate the config, show which model it resolves to
+wayland-wispr check-config    # validate the config, show which model and theme files it uses
+wayland-wispr default-theme   # print the built-in overlay CSS (template for overlay.theme)
 wayland-wispr bench <wav>     # measure the configured whisper model on this machine
 wayland-wispr cleanup "text"  # run LLM cleanup on a text (or stdin)
 wayland-wispr cleanup-eval dev/cleanup-fixtures.toml  # compare models/prompts
@@ -50,6 +51,7 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/controller.rs` | Pure session state machine with session IDs (unit-tested) |
 | `src/ipc.rs` | Versioned, size-bounded JSON-line Unix socket protocol |
 | `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0, click-through; configurable position/output; waveform + elapsed time while recording) |
+| `src/theme.rs` | Custom CSS themes over the built-in one; light/dark variants follow darkman's D-Bus API, else the portal `color-scheme` |
 | `src/probe.rs` | Native `wayland-client` global probe on its own connection |
 | `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
 | `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` direct typing and paste chord (`wayland-protocols-misc`) |
@@ -57,6 +59,49 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/cleanup/` | LLM cleanup: blocking `ureq` client for streamed `/chat/completions` (cancellable, output-capped), built-in few-shot prompt (`prompt.toml`), reply sanitizing/guards with raw fallback, `cleanup`/`cleanup-eval` commands |
 | `src/bench.rs` | `bench` subcommand: load time, latency, RSS and VRAM per model/device |
 | `src/config.rs` | TOML settings with validation |
+
+## Themes
+
+The overlay ships one built-in default theme. `overlay.theme` layers your own
+GTK CSS on top of it. That CSS is loaded at a higher priority than the built-in
+stylesheet, so it can override any rule. Print the built-in stylesheet with
+`wayland-wispr default-theme` to see the classes: `.pill`, `.dot`, the state
+classes `.recording`/`.processing`/`.ready`/`.error` on the pill, `.step`
+(`.pending`/`.active`/`.done`), `spinner.busy`, `.wave` (bar colour), `.status`,
+`.time`, `.detail`.
+
+```toml
+[overlay]
+theme = "theme.css"                    # one stylesheet, always used
+
+# or: light/dark variants, switched live
+[overlay.theme]
+light = "light.css"
+dark = "dark.css"                      # either may be omitted = default theme
+```
+
+Variants follow [darkman](https://darkman.whynothugo.nl/) over D-Bus
+(`nl.whynothugo.darkman`, `Mode` + `ModeChanged`). They pick up darkman
+starting or restarting at any time. While darkman is not running, they follow
+the XDG desktop portal's `org.freedesktop.appearance color-scheme`, and fall
+back to `dark` when neither gives a preference. Each switch re-reads the file,
+so edits show up at the next mode change.
+
+- A rule in your theme wins over **every** built-in rule for the same property
+  on the elements it matches, regardless of selector specificity. So a plain
+  `.dot { background-color: … }` also replaces the recording/processing
+  colours; restate the state rules, as [themes/light.css](themes/light.css)
+  (a complete light example) does.
+- A background colour in your theme replaces `overlay.opacity`; `overlay.scale`
+  only scales the built-in sizes.
+- The pill's width is measured once at startup with the variant active then
+  (the single theme, or `dark`). Variants should therefore change colours,
+  not sizes or fonts.
+- A shadow needs room inside the layer surface: give `window.wispr` padding
+  (as `themes/light.css` does). That padding adds to `overlay.margin` on
+  anchored edges.
+- A missing file or CSS error is logged (`overlay theme`); the default theme
+  stays in effect for anything not applied. `check-config` lists the files.
 
 ## Local transcription (whisper)
 
@@ -202,6 +247,11 @@ services.wayland-wispr = {
   checked at build time with `wayland-wispr check-config`, so typos and invalid
   values fail `home-manager switch` instead of the service. With empty
   `settings`, no file is written.
+- **Themes:** Nix paths work directly and are copied to the store, e.g.
+  `settings.overlay.theme.light = ./wispr-light.css;`. The example themes are
+  installed with the package:
+  `"${config.services.wayland-wispr.package}/share/wayland-wispr/themes/light.css"`.
+  A changed file restarts the service.
 - **Models:** `models` (default: the configured `transcription.whisper.model`)
   are fetched from the pinned whisper.cpp repo and linked into
   `~/.local/share/wayland-wispr/models/`, the directory the app already uses.

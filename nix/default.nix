@@ -36,7 +36,7 @@ rustPlatform.buildRustPackage {
 
   # Only what cargo needs: keeps dev/models (GiBs) and target/ out of the store
   # and avoids rebuilds when docs or nix files change. The example/dev configs
-  # and fixtures are `include_str!`ed by tests.
+  # and fixtures are `include_str!`ed by tests; example themes are installed.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -46,6 +46,7 @@ rustPlatform.buildRustPackage {
       ../config.example.toml
       ../dev/config.toml
       ../dev/cleanup-fixtures.toml
+      ../themes
     ];
   };
 
@@ -77,6 +78,11 @@ rustPlatform.buildRustPackage {
   ];
 
   dontUseCmakeConfigure = true;
+
+  # Example stylesheets for `overlay.theme`.
+  postInstall = ''
+    install -Dm644 -t $out/share/wayland-wispr/themes themes/*.css
+  '';
 
   env = ggmlCpuFlags;
 

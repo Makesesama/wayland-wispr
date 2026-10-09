@@ -8,6 +8,7 @@ mod controller;
 mod injection;
 mod ipc;
 mod probe;
+mod theme;
 mod transcription;
 mod ui;
 
@@ -83,6 +84,9 @@ enum Cmd {
     /// Validate the config file and report which whisper model it resolves
     /// to. Fails only on config errors; a missing model is reported.
     CheckConfig,
+    /// Print the built-in overlay stylesheet (the default theme) for the
+    /// configured scale and opacity; a starting point for `overlay.theme`.
+    DefaultTheme,
     /// Report native Wayland protocol support of the current compositor.
     Probe {
         /// Print JSON instead of a table.
@@ -178,6 +182,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::CheckConfig => {
             let config = Config::load(cli.config.as_deref())?;
             check_config(&config);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::DefaultTheme => {
+            let config = Config::load(cli.config.as_deref())?;
+            print!("{}", ui::css(config.overlay.scale, config.overlay.opacity));
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Bench {
@@ -293,6 +302,11 @@ fn devices(config: &Config, json: bool) -> anyhow::Result<ExitCode> {
 
 fn check_config(config: &Config) {
     println!("config ok");
+    // Reported, not required: a missing theme falls back to the default.
+    for path in config.overlay.theme.iter().flat_map(|t| t.paths()) {
+        let state = if path.is_file() { "ok" } else { "missing" };
+        println!("theme: {} ({state})", path.display());
+    }
     if config.transcription.backend != TranscriptionBackend::Whisper {
         return;
     }
