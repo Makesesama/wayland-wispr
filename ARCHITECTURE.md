@@ -477,7 +477,8 @@ VRAM for e.g. a local cleanup LLM. GPU mode never falls back to CPU silently.
 - [x] Model absence/invalid file, GPU missing (Vulkan build without driver),
       unknown language codes, CPU-only build asked for GPU: clear errors.
 - [ ] Memory exhaustion behaviour on a nearly full GPU.
-- [ ] Packaging: Nix-fetched models (fixed hashes) and per-host config via Home Manager.
+- [x] Packaging: Nix-fetched models (fixed hashes) and per-host config via Home Manager
+      (`nix/models.nix`, `nix/service.nix`).
 
 **Acceptance:** transcription works with network unavailable and no API key;
 local STT + disabled/local cleanup never contacts a remote provider. The API-only
@@ -486,9 +487,10 @@ build remains usable without local inference enabled.
 ### Phase 8 — Reliability, packaging, and polish
 
 - [ ] Run formatting, Clippy, unit/integration tests, and end-to-end compositor tests.
-- [ ] Package the application in the flake with GTK runtime wrapping; currently
-      the flake only defines dev shells and a formatter, not app outputs.
-- [ ] Add optional user-service/Home Manager integration without requiring root.
+- [x] Package the application in the flake with GTK runtime wrapping
+      (`nix/default.nix`; CPU and Vulkan variants, tests run in the build).
+- [x] Add optional user-service/Home Manager integration without requiring root
+      (`nix/service.nix`).
 - [ ] Exercise x86_64/aarch64 builds and test the intended host/compositor matrix.
 - [ ] Improve device selection/settings/errors; add waveform/animation afterward.
 - [ ] Evaluate VAD, clipboard preservation, GPU acceleration, and portal shortcuts

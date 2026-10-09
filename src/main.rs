@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, WhisperDevice};
+use crate::config::{Config, TranscriptionBackend, WhisperDevice};
 use crate::controller::Command;
 
 /// Wayland-native dictation overlay.
@@ -79,6 +79,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Validate the config file and report which whisper model it resolves
+    /// to. Fails only on config errors; a missing model is reported.
+    CheckConfig,
     /// Report native Wayland protocol support of the current compositor.
     Probe {
         /// Print JSON instead of a table.
@@ -171,6 +174,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Probe { json } => return probe(json),
+        Cmd::CheckConfig => {
+            let config = Config::load(cli.config.as_deref())?;
+            check_config(&config);
+            return Ok(ExitCode::SUCCESS);
+        }
         Cmd::Bench {
             wav,
             runs,
@@ -280,6 +288,24 @@ fn devices(config: &Config, json: bool) -> anyhow::Result<ExitCode> {
     println!();
     println!("* = default. Select with `[audio] device = \"<name or id>\"`.");
     Ok(ExitCode::SUCCESS)
+}
+
+fn check_config(config: &Config) {
+    println!("config ok");
+    if config.transcription.backend != TranscriptionBackend::Whisper {
+        return;
+    }
+    #[cfg(feature = "local-whisper")]
+    match transcription::model::locate(&config.transcription.whisper) {
+        Ok(m) => println!(
+            "whisper model: {} ({} MiB)",
+            m.path.display(),
+            m.bytes / (1 << 20)
+        ),
+        Err(e) => println!("whisper model: {e}"),
+    }
+    #[cfg(not(feature = "local-whisper"))]
+    println!("whisper model: this build lacks the `local-whisper` feature");
 }
 
 fn probe(json: bool) -> anyhow::Result<ExitCode> {

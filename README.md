@@ -10,7 +10,7 @@ capability probe, microphone capture (native PipeWire, ALSA fallback), local
 whisper.cpp transcription (CPU or Vulkan GPU), LLM cleanup through a
 user-run OpenAI-compatible server (e.g. Ollama), and native clipboard/paste
 insertion work. The remote transcription API backend is **not implemented
-yet**. No Nix app package yet.
+yet**. Nix package and home-manager service: see [Nix](#nix).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
 Wayland constraints, and phased implementation checklist with acceptance criteria.
@@ -32,6 +32,7 @@ wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
 wayland-wispr insert          # copy, then send the paste chord to the focused app
 wayland-wispr insert --raw    # same with the raw transcript (also `copy --raw`)
+wayland-wispr check-config    # validate the config, show which model it resolves to
 wayland-wispr bench <wav>     # measure the configured whisper model on this machine
 wayland-wispr cleanup "text"  # run LLM cleanup on a text (or stdin)
 wayland-wispr cleanup-eval dev/cleanup-fixtures.toml  # compare models/prompts
@@ -147,6 +148,65 @@ nothing is retried automatically. Terminals usually need
 `injection.paste_chord = "ctrl+shift+v"`. The paste uses a fixed US keymap on a
 short-lived virtual keyboard, independent of your layout.
 
+## Nix
+
+Everything lives in [nix/](nix/); `flake.nix` only wires it up.
+
+| File | Purpose |
+| --- | --- |
+| `nix/default.nix` | Package (`callPackage`-style). `vulkanSupport = true` builds whisper.cpp with Vulkan; `ggmlCpuFlags` overrides the CPU SIMD level |
+| `nix/ggml-cpu.nix` | `GGML_*` flags shared by package and shell (x86-64-v3 on x86_64, because the Nix compiler wrapper strips `-march=native`) |
+| `nix/shell.nix` | Dev shell (`nix develop`, or `nix-shell nix/shell.nix`) |
+| `nix/service.nix` | home-manager module: systemd user service, config file, models |
+| `nix/models.nix`, `nix/models.json` | Pinned whisper.cpp ggml models from Hugging Face (fixed-output fetches) |
+| `nix/update-models.sh` | Regenerates `models.json` from the Hugging Face API (hashes from LFS metadata, no downloads) |
+
+Flake outputs: `packages.<system>.{wayland-wispr,wayland-wispr-vulkan,default}`,
+`overlays.default`, `homeManagerModules.{wayland-wispr,default}`,
+`legacyPackages.<system>.whisperModels.<name>`, `devShells`, `checks`.
+
+```nix
+# flake inputs
+wayland-wispr.url = "git+ssh://git@git.makussu.de:2122/Makussu/wayland-wispr.git";
+wayland-wispr.inputs.nixpkgs.follows = "nixpkgs";
+
+# home-manager
+imports = [ inputs.wayland-wispr.homeManagerModules.default ];
+services.wayland-wispr = {
+  enable = true;
+  package = inputs.wayland-wispr.packages.${pkgs.stdenv.hostPlatform.system}.wayland-wispr-vulkan;
+  settings = {
+    transcription.whisper = {
+      model = "large-v3-turbo-q5_0"; # fetched and linked automatically
+      device = "gpu";
+      languages = [ "de" "en" ];
+      beam_size = 5;
+    };
+    cleanup.model = "qwen2.5:7b-instruct";
+  };
+  models = [ "large-v3-turbo-q5_0" "small-q5_1" ]; # optional: extra models for `bench`
+};
+```
+
+- **Config:** `settings` becomes `~/.config/wayland-wispr/config.toml` and is
+  checked at build time with `wayland-wispr check-config`, so typos and invalid
+  values fail `home-manager switch` instead of the service. With empty
+  `settings`, no file is written.
+- **Models:** `models` (default: the configured `transcription.whisper.model`)
+  are fetched from the pinned whisper.cpp repo and linked into
+  `~/.local/share/wayland-wispr/models/`, the directory the app already uses.
+  Manually downloaded models there keep working. `extraModels` links your own
+  files by name. Setting `model_path`/`models_dir` bypasses the links (the
+  module warns).
+- **Service:** `wayland-wispr.service` runs `wayland-wispr run` with
+  `graphical-session.target`. Your session must import `WAYLAND_DISPLAY` into
+  the systemd user environment (e.g. `systemctl --user import-environment
+  WAYLAND_DISPLAY` from the river init). A config or model change restarts it.
+  Secrets for `cleanup.api_key_env` go in `environmentFile`, never `settings`.
+  The module does not run Ollama; use `services.ollama` on the system.
+- Bind `wayland-wispr toggle`, `insert`, and `cancel` in the WM. The package is
+  added to `home.packages`.
+
 ## Development
 
 ```sh
@@ -213,7 +273,7 @@ Check the environment:
 
 ```sh
 nix flake check --all-systems --no-build
-nix fmt -- flake.nix
+nix fmt -- flake.nix nix/*.nix   # nixfmt needs file arguments
 nix develop -c sh -c 'rustc --version; cargo --version; pkg-config --modversion gtk4 gtk4-layer-shell-0 alsa'
 ```
 
