@@ -21,7 +21,7 @@ backend = "whisper"             # "fake" skips the model (UI/insertion tests)
 [transcription.whisper]
 # Models live in dev/models/ (gitignored); see README for downloads.
 models_dir = "models"
-# RX 7900 XT: run with `cargo run --features whisper-vulkan -- run`.
+# GPU (RX 9070 XT = gpu_device 0; the iGPU is 1): run with `cargo run --features whisper-vulkan -- run`.
 # Without the GPU build use device = "cpu" and e.g. model = "small-q5_1".
 model = "large-v3-turbo-q5_0"
 device = "gpu"

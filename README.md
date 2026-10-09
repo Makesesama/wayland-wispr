@@ -67,7 +67,7 @@ Small vs. large is a per-machine config choice, not a different code path:
 
 | Machine | Suggested | Notes |
 | --- | --- | --- |
-| Discrete GPU (e.g. RX 7900 XT) | `large-v3-turbo-q5_0`, `device = "gpu"`, `beam_size = 5` | build with `--features whisper-vulkan` |
+| Discrete GPU (e.g. RX 9070 XT) | `large-v3-turbo-q5_0`, `device = "gpu"`, `beam_size = 5` | build with `--features whisper-vulkan`; ~0.3 s per clip, ~0.9 GiB VRAM |
 | CPU only / little VRAM | `small-q5_1` or `base-q5_1`, `device = "cpu"` | |
 
 Use multilingual models (not `.en`) for German. `languages = ["de", "en"]`

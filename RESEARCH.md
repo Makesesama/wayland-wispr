@@ -239,8 +239,23 @@ restricted de/en detection (2 encoder passes), greedy:
 | large-v3-turbo-q5_0 | 250 ms | 16.2 s | 2.30 | 746 MiB | 16.7 s |
 
 All three transcribed the clip correctly. Conclusion: large-v3-turbo needs a
-GPU; CPU-only hosts should use small (or base). Vulkan numbers for the RX 7900 XT
-still need to be measured with `wayland-wispr bench --device gpu`.
+GPU; CPU-only hosts should use small (or base).
+
+Vulkan benchmark — RX 9070 XT (16 GiB, RADV GFX1201), same build flags,
+large-v3-turbo-q5_0, flash attention, beam 5, restricted de/en detection,
+6.9 s clip:
+
+| Load | Latency (runs 1–3) | RTF | VRAM after load | VRAM peak | Process RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 212 ms | 313 / 291 / 261 ms | ≈ 0.04 | +820 MiB | +890 MiB | 145 MiB |
+
+About 50x faster than the same model on the CPU, using < 1 GiB VRAM (device-wide
+free-memory delta). That leaves ~13 GiB for a local cleanup LLM: a 7B model at
+Q4 (~4.5–5 GiB weights plus KV cache) fits alongside Whisper, so unloading
+Whisper before cleanup is unnecessary on this host; `keep_loaded = "idle"`
+stays the sensible default. Notes: the Ryzen iGPU is enumerated too (gpu 1, shared
+memory), so `gpu_device = 0` matters; RADV prints a harmless "not a
+conformant Vulkan implementation" warning for GFX12.
 
 ### Sources
 

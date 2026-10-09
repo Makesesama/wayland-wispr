@@ -442,8 +442,9 @@ VRAM for e.g. a local cleanup LLM. GPU mode never falls back to CPU silently.
       (`Effect::AbortProcessing`); stale results still rejected by session ID.
 - [x] `bench` subcommand: load time, latency/RTF, RSS, device-wide VRAM delta.
 - [x] CPU measurements on the dev machine (RESEARCH.md §2).
-- [ ] Vulkan measurements on the RX 7900 XT (turbo, beam 1/5); MacBook CPU (small/base).
-- [ ] Manual end-to-end test on riverfx with a real microphone.
+- [x] Vulkan measurements on the RX 9070 XT (turbo, beam 5; RESEARCH.md §2).
+- [ ] MacBook (Asahi) CPU measurements (small/base).
+- [x] Manual end-to-end test on riverfx with a real microphone.
 - [x] Model absence/invalid file, GPU missing (Vulkan build without driver),
       unknown language codes, CPU-only build asked for GPU: clear errors.
 - [ ] Memory exhaustion behaviour on a nearly full GPU.
