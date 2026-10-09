@@ -10,22 +10,10 @@ mod virtual_keyboard;
 use std::thread;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use crate::config::{InjectionConfig, InsertMethod};
 use chord::Chord;
 use typing::Newline;
 use virtual_keyboard::{Batch, Timing};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Action {
-    /// Put the result on the clipboard; the user pastes.
-    Copy,
-    /// Put the result on the clipboard and type or paste it into the
-    /// focused application.
-    Insert,
-}
 
 #[derive(Debug)]
 enum Method {
@@ -65,12 +53,16 @@ impl Injector {
         })
     }
 
+    /// Put `text` on the clipboard. Blocking; run off the GTK and
+    /// controller threads.
+    pub fn copy(&self, text: &str) -> Result<(), String> {
+        clipboard::set_text(text)
+    }
+
+    /// Copy `text`, then type or paste it into the focused application.
     /// Blocking; run off the GTK and controller threads.
-    pub fn run(&self, action: Action, text: &str) -> Result<(), String> {
+    pub fn insert(&self, text: &str) -> Result<(), String> {
         clipboard::set_text(text)?;
-        if action == Action::Copy {
-            return Ok(());
-        }
 
         // Give the user a moment to release the physical keybinding that
         // triggered insertion.

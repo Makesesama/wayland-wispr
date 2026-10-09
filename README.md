@@ -164,6 +164,9 @@ riverctl map normal Super+Shift D spawn 'wayland-wispr cancel'
 # river: push-to-talk instead (hold to record, release to process)
 riverctl map         normal Super D spawn 'wayland-wispr start'
 riverctl map -release normal Super D spawn 'wayland-wispr stop'
+
+# river: quick notes (see "Taking notes" below)
+riverctl map normal Super N spawn 'wayland-wispr note'
 ```
 
 ```ini
@@ -252,6 +255,77 @@ Use `insert --raw` or `copy --raw` when the cleaned text is wrong: they use
 the original transcript. With `injection.on_ready = "none"` nothing happens
 automatically, and the result waits for an explicit `copy` or `insert`.
 That is useful when you want to choose the target window first.
+
+### Taking notes
+
+`wayland-wispr note` works like `toggle`, but the result is not typed. It is
+piped into a script of your choice, the **note hook**, which can put it
+wherever you like: append it to a Markdown file, add it to your notes app,
+create a todo, upload it, … The hook is any executable, in any language.
+
+1. Write the hook. It gets the (cleaned) transcript on **stdin**:
+
+   ```sh
+   #!/bin/sh
+   # ~/.config/wayland-wispr/note.sh: append to a daily inbox
+   set -e
+   mkdir -p ~/notes
+   { printf '\n## %s\n\n' "$(date '+%Y-%m-%d %H:%M')"; cat; echo; } >> ~/notes/inbox.md
+   ```
+
+   ```sh
+   chmod +x ~/.config/wayland-wispr/note.sh
+   ```
+
+2. Point the config at it and restart the service:
+
+   ```toml
+   [note]
+   hook = "note.sh"   # relative to config.toml; absolute and ~/ paths work too
+   ```
+
+3. Bind `wayland-wispr note` to a key, press it, speak, and press it again.
+
+While recording a note, the dot and waveform are blue. The pill shows
+"Saving note…" while the hook runs and "Note saved" when it exits with
+status 0.
+
+- **Contract:** the text arrives on stdin, without a trailing newline.
+  `WAYLAND_WISPR_SESSION` holds the session number. The hook runs directly,
+  not through a shell, with the service's environment and working directory,
+  so use absolute paths or set `PATH` in the script. The variable named by
+  `cleanup.api_key_env` is removed from its environment.
+- **Output:** stdout is ignored. stderr is logged (`journalctl --user -u
+  wayland-wispr`), so don't echo the note there if you don't want it in the
+  log. The last stderr line of a failed hook appears in the overlay, but never
+  in `status`.
+- **Failure:** a non-zero exit status shows "Note failed" with the status and
+  the last line of stderr. If the hook runs longer than `note.timeout_secs`
+  (default 30), it is killed together with everything it started. Either
+  way the note is kept: run `note` again to retry, or `copy`/`insert` it.
+  `cancel` discards it, and also stops a hook that is still running.
+- **Background jobs:** a hook may start something in the background and exit,
+  but then redirect that job's stdin and stderr (`… </dev/null 2>/dev/null &`).
+  Otherwise it keeps the pipes to wayland-wispr open.
+- **Switching:** pressing `note` while a normal dictation is recording turns
+  it into a note. `toggle` and `stop` end a note recording, too. With
+  `injection.on_ready = "none"`, `note` also sends a waiting result to the hook.
+- **Cleanup** applies to notes as to dictation; `copy --raw` after a failed
+  hook gets the raw transcript.
+
+With home-manager, the hook can live in your configuration. Store paths are
+absolute, so this works without touching `PATH`:
+
+```nix
+services.wayland-wispr.settings.note.hook = lib.getExe (pkgs.writeShellApplication {
+  name = "wispr-note";
+  runtimeInputs = [ pkgs.coreutils ];
+  text = ''
+    mkdir -p ~/notes
+    { printf '\n## %s\n\n' "$(date '+%Y-%m-%d %H:%M')"; cat; echo; } >> ~/notes/inbox.md
+  '';
+});
+```
 
 ### Choosing a whisper model
 
@@ -350,7 +424,7 @@ services.wayland-wispr.settings.overlay.theme = {
 ```
 
 - **Classes:** `.pill` carries the state classes `.recording`, `.processing`,
-  `.ready` and `.error`. Inside it are `.dot`, `.wave` (bar colour), `.time`,
+  `.ready` and `.error`, plus `.note` during a `note` session. Inside it are `.dot`, `.wave` (bar colour), `.time`,
   `.status`, `.detail`, `.step` (with `.pending`, `.active`, `.done`) and
   `spinner.busy`.
 - **Light/dark switching:** variants follow
@@ -466,6 +540,13 @@ Unknown keys are errors. Relative paths are relative to the config file. Only
 | `pre_insert_delay_ms` | `150` | Time to release the triggering keybinding before typing |
 | `key_delay_ms` | `10` | Delay after keymap changes and while a chord is held |
 
+### `[note]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `hook` | – | Executable that gets the transcript on stdin for `wayland-wispr note`; see [Taking notes](#taking-notes). Unset: `note` is unavailable. |
+| `timeout_secs` | `30` | The hook is killed after this many seconds (1–3600) |
+
 ### `[debug]`
 
 | Key | Default | Description |
@@ -483,11 +564,12 @@ wayland-wispr start | stop        push-to-talk press / release
 wayland-wispr cancel              discard recording, processing or result (alias: abort)
 wayland-wispr insert [--raw]      copy the ready result and type/paste it into the focused app
 wayland-wispr copy [--raw]        copy the ready result to the clipboard
+wayland-wispr note                like toggle, but pipe the result into note.hook
 wayland-wispr status              JSON state of the running instance (no transcript text)
 
 wayland-wispr probe [--json]      check the compositor's Wayland protocols
 wayland-wispr devices [--json]    list microphones
-wayland-wispr check-config        validate the config, show resolved model and theme files
+wayland-wispr check-config        validate the config, show resolved model, theme and hook files
 wayland-wispr default-theme       print the built-in overlay CSS
 wayland-wispr bench <wav>         load time, latency, RAM/VRAM of a whisper model
                                   [--model, --model-path, --device, --beam-size, --language, --threads, --runs]

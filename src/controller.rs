@@ -7,9 +7,21 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cleanup::{CleanupStatus, Processed};
-use crate::injection::Action;
 
 pub type SessionId = u64;
+
+/// What happens to a ready result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Put the result on the clipboard; the user pastes.
+    Copy,
+    /// Put the result on the clipboard and type or paste it into the
+    /// focused application.
+    Insert,
+    /// Pass the result to the user's `note.hook` on stdin.
+    Note,
+}
 
 /// Commands accepted from the CLI over IPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +38,9 @@ pub enum Command {
     CopyRaw,
     /// Like `Insert`, but the raw transcript instead of the cleaned text.
     InsertRaw,
+    /// Like `Toggle`, but the result goes to the note hook; with a ready
+    /// result, pass that to the hook.
+    Note,
 }
 
 /// Events produced by background work owned by the runtime.
@@ -43,9 +58,9 @@ pub enum Internal {
         session: SessionId,
         message: String,
     },
-    InjectionFinished {
+    DeliveryFinished {
         session: SessionId,
-        result: Result<(), String>,
+        result: Result<(), Failure>,
     },
 }
 
@@ -54,16 +69,20 @@ pub enum State {
     Idle,
     Recording {
         session: SessionId,
+        /// Started automatically once the result is ready.
+        on_ready: Option<Action>,
     },
     Processing {
         session: SessionId,
+        on_ready: Option<Action>,
     },
     Ready {
         session: SessionId,
         result: Processed,
-        /// Why the last copy/insert attempt failed, if it did.
-        notice: Option<String>,
+        /// Why the last copy/insert/note attempt failed, if it did.
+        notice: Option<Notice>,
     },
+    /// Copying, inserting, or running the note hook.
     Inserting {
         session: SessionId,
         /// Kept so a failed insertion returns to `Ready` with everything.
@@ -75,6 +94,38 @@ pub enum State {
         session: Option<SessionId>,
         message: String,
     },
+}
+
+/// Why a copy/insert/note failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Written by us; safe for `status`, replies, and logs.
+    pub message: String,
+    /// Written by the note hook (its last stderr line). May contain anything,
+    /// including the transcript, so it is only shown in the overlay.
+    pub detail: Option<String>,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            detail: None,
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+/// A failed delivery of a ready result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub action: Action,
+    pub failure: Failure,
 }
 
 /// Side effects the runtime must perform after a transition.
@@ -91,13 +142,15 @@ pub enum Effect {
     /// Stop processing a session (e.g. abort native inference). Its result,
     /// if one still arrives, is ignored.
     AbortProcessing { session: SessionId },
-    /// Copy or insert a ready result. Must be followed by exactly one
-    /// [`Internal::InjectionFinished`]; it is never retried automatically.
-    Inject {
+    /// Copy, insert, or note a ready result. Must be followed by exactly
+    /// one [`Internal::DeliveryFinished`]; it is never retried automatically.
+    Deliver {
         session: SessionId,
         action: Action,
         text: String,
     },
+    /// Stop the note hook of a session (kill it). Its result is ignored.
+    AbortDelivery { session: SessionId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +180,9 @@ pub struct Status {
     /// Why cleanup failed and the raw transcript is used instead.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cleanup_error: Option<String>,
+    /// The session's result goes (or went) to the note hook.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub note: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +207,8 @@ pub struct Controller {
     last_session: SessionId,
     /// Copy/insert started automatically when a result becomes ready.
     on_ready: Option<Action>,
+    /// Whether a note hook is configured.
+    notes: bool,
 }
 
 impl Default for Controller {
@@ -171,7 +229,14 @@ impl Controller {
             state: State::Idle,
             last_session: 0,
             on_ready,
+            notes: false,
         }
+    }
+
+    /// Accept `note` (a note hook is configured).
+    pub fn with_notes(mut self, notes: bool) -> Self {
+        self.notes = notes;
+        self
     }
 
     pub fn state(&self) -> &State {
@@ -181,8 +246,10 @@ impl Controller {
     pub fn status(&self) -> Status {
         let (state, session, result, error) = match &self.state {
             State::Idle => (StateKind::Idle, None, None, None),
-            State::Recording { session } => (StateKind::Recording, Some(*session), None, None),
-            State::Processing { session } => (StateKind::Processing, Some(*session), None, None),
+            State::Recording { session, .. } => (StateKind::Recording, Some(*session), None, None),
+            State::Processing { session, .. } => {
+                (StateKind::Processing, Some(*session), None, None)
+            }
             State::Ready {
                 session,
                 result,
@@ -191,7 +258,7 @@ impl Controller {
                 StateKind::Ready,
                 Some(*session),
                 Some(result),
-                notice.clone(),
+                notice.as_ref().map(|n| n.failure.message.clone()),
             ),
             State::Inserting {
                 session, result, ..
@@ -214,6 +281,18 @@ impl Controller {
             error,
             cleanup: result.map(|r| r.cleanup),
             cleanup_error: result.and_then(|r| r.cleanup_error.clone()),
+            note: self.is_note(),
+        }
+    }
+
+    /// The current session is a note (recorded with or delivered to the hook).
+    fn is_note(&self) -> bool {
+        match &self.state {
+            State::Recording { on_ready, .. } | State::Processing { on_ready, .. } => {
+                *on_ready == Some(Action::Note)
+            }
+            State::Inserting { action, .. } => *action == Action::Note,
+            _ => false,
         }
     }
 
@@ -224,19 +303,55 @@ impl Controller {
         let result: Result<Option<&'static str>, &'static str> = match (cmd, &self.state) {
             (Command::Status, _) => Ok(None),
 
+            (Command::Note, _) if !self.notes => {
+                Err("no note hook configured; set `note.hook` in the config")
+            }
+
             (Command::Toggle | Command::Start, State::Idle | State::Error { .. }) => {
-                self.start_recording(&mut out);
+                self.start_recording(self.on_ready, &mut out);
+                Ok(None)
+            }
+            (Command::Note, State::Idle | State::Error { .. }) => {
+                self.start_recording(Some(Action::Note), &mut out);
                 Ok(None)
             }
             (Command::Toggle | Command::Stop, State::Recording { .. }) => {
                 self.stop_recording(&mut out);
                 Ok(None)
             }
+            // Whatever started it, this recording becomes a note.
+            (Command::Note, State::Recording { session, .. }) => {
+                let session = *session;
+                self.set(
+                    State::Recording {
+                        session,
+                        on_ready: Some(Action::Note),
+                    },
+                    &mut out,
+                );
+                self.stop_recording(&mut out);
+                Ok(None)
+            }
             (Command::Start, State::Recording { .. }) => Ok(Some("already recording")),
             (Command::Stop, _) => Ok(Some("not recording")),
 
+            // Copy/insert finish quickly and must not be cut off mid-typing;
+            // a note hook may hang on the network, so it can be cancelled.
+            (
+                Command::Cancel,
+                State::Inserting {
+                    session,
+                    action: Action::Note,
+                    ..
+                },
+            ) => {
+                out.effects
+                    .push(Effect::AbortDelivery { session: *session });
+                self.set(State::Idle, &mut out);
+                Ok(Some("cancelled"))
+            }
             (_, State::Inserting { .. }) => Err("insertion in progress"),
-            (Command::Toggle | Command::Start, State::Processing { .. }) => {
+            (Command::Toggle | Command::Start | Command::Note, State::Processing { .. }) => {
                 Err("still processing; use `cancel` to discard")
             }
             (Command::Toggle | Command::Start, State::Ready { .. }) => {
@@ -246,10 +361,10 @@ impl Controller {
             (Command::Cancel, State::Idle) => Ok(Some("nothing to cancel")),
             (Command::Cancel, state) => {
                 match state {
-                    State::Recording { session } => out
+                    State::Recording { session, .. } => out
                         .effects
                         .push(Effect::DiscardCapture { session: *session }),
-                    State::Processing { session } => out
+                    State::Processing { session, .. } => out
                         .effects
                         .push(Effect::AbortProcessing { session: *session }),
                     _ => {}
@@ -259,13 +374,18 @@ impl Controller {
             }
 
             (
-                Command::Copy | Command::Insert | Command::CopyRaw | Command::InsertRaw,
+                Command::Copy
+                | Command::Insert
+                | Command::CopyRaw
+                | Command::InsertRaw
+                | Command::Note,
                 State::Ready {
                     session, result, ..
                 },
             ) => {
                 let action = match cmd {
                     Command::Copy | Command::CopyRaw => Action::Copy,
+                    Command::Note => Action::Note,
                     _ => Action::Insert,
                 };
                 let raw = matches!(cmd, Command::CopyRaw | Command::InsertRaw);
@@ -275,7 +395,7 @@ impl Controller {
                     result.text.clone()
                 };
                 let (session, result) = (*session, result.clone());
-                out.effects.push(Effect::Inject {
+                out.effects.push(Effect::Deliver {
                     session,
                     action,
                     text,
@@ -289,7 +409,13 @@ impl Controller {
                     },
                     &mut out,
                 );
-                return (None, out);
+                if action != Action::Note {
+                    return (None, out);
+                }
+                // A hook may run long; replying when it is done would block
+                // the control socket (and `cancel`) meanwhile. Its outcome
+                // shows in the overlay and `status`.
+                Ok(Some("saving note"))
             }
             (Command::Copy | Command::Insert | Command::CopyRaw | Command::InsertRaw, _) => {
                 Err("no ready result")
@@ -307,13 +433,21 @@ impl Controller {
         let mut out = Outcome::default();
         match event {
             Internal::ProcessingFinished { session, result } => {
-                if self.state != (State::Processing { session }) {
+                let State::Processing {
+                    session: current,
+                    on_ready,
+                } = self.state
+                else {
+                    tracing::debug!(session, "ignoring stale processing result");
+                    return out;
+                };
+                if current != session {
                     tracing::debug!(session, "ignoring stale processing result");
                     return out;
                 }
-                let next = match (result, self.on_ready) {
+                let next = match (result, on_ready) {
                     (Ok(result), Some(action)) => {
-                        out.effects.push(Effect::Inject {
+                        out.effects.push(Effect::Deliver {
                             session,
                             action,
                             text: result.text.clone(),
@@ -338,14 +472,14 @@ impl Controller {
                 self.set(next, &mut out);
             }
             Internal::RecordingLimitReached { session } => {
-                if self.state != (State::Recording { session }) {
+                if !self.is_recording(session) {
                     return out;
                 }
                 tracing::info!(session, "maximum recording duration reached");
                 self.stop_recording(&mut out);
             }
             Internal::CaptureFailed { session, message } => {
-                if self.state != (State::Recording { session }) {
+                if !self.is_recording(session) {
                     return out;
                 }
                 out.effects.push(Effect::DiscardCapture { session });
@@ -357,7 +491,7 @@ impl Controller {
                     &mut out,
                 );
             }
-            Internal::InjectionFinished { session, result } => {
+            Internal::DeliveryFinished { session, result } => {
                 let State::Inserting {
                     session: current,
                     result: processed,
@@ -379,16 +513,18 @@ impl Controller {
                             (Action::Copy, true) => "copied raw transcript to clipboard",
                             (Action::Insert, false) => "inserted",
                             (Action::Insert, true) => "inserted raw transcript",
+                            (Action::Note, _) => "note saved",
                         };
                         (true, msg.to_owned())
                     }
-                    Err(message) => {
+                    Err(failure) => {
+                        let message = failure.message.clone();
                         // Keep the result so the user can retry or copy manually.
                         self.set(
                             State::Ready {
                                 session,
                                 result: processed,
-                                notice: Some(message.clone()),
+                                notice: Some(Notice { action, failure }),
                             },
                             &mut out,
                         );
@@ -409,19 +545,23 @@ impl Controller {
         }
     }
 
-    fn start_recording(&mut self, out: &mut Outcome) {
+    fn is_recording(&self, session: SessionId) -> bool {
+        matches!(self.state, State::Recording { session: s, .. } if s == session)
+    }
+
+    fn start_recording(&mut self, on_ready: Option<Action>, out: &mut Outcome) {
         self.last_session += 1;
         let session = self.last_session;
-        self.set(State::Recording { session }, out);
+        self.set(State::Recording { session, on_ready }, out);
         out.effects.push(Effect::StartCapture { session });
         out.effects.push(Effect::ScheduleRecordingLimit { session });
     }
 
     fn stop_recording(&mut self, out: &mut Outcome) {
-        let State::Recording { session } = self.state else {
+        let State::Recording { session, on_ready } = self.state else {
             return;
         };
-        self.set(State::Processing { session }, out);
+        self.set(State::Processing { session, on_ready }, out);
         out.effects.push(Effect::StartProcessing { session });
     }
 
@@ -541,7 +681,13 @@ mod tests {
             result: Ok(plain("old")),
         });
         assert!(!o.changed);
-        assert_eq!(c.state(), &State::Recording { session: 2 });
+        assert_eq!(
+            c.state(),
+            &State::Recording {
+                session: 2,
+                on_ready: None
+            }
+        );
 
         // Old recording-limit timers must not stop the new session.
         let o = c.handle_internal(Internal::RecordingLimitReached { session: 1 });
@@ -612,7 +758,13 @@ mod tests {
         assert_eq!(c.status().error.as_deref(), Some("boom"));
         let (r, _) = run(&mut c, Command::Toggle);
         assert!(r.ok);
-        assert_eq!(c.state(), &State::Recording { session: 2 });
+        assert_eq!(
+            c.state(),
+            &State::Recording {
+                session: 2,
+                on_ready: None
+            }
+        );
     }
 
     #[test]
@@ -631,7 +783,7 @@ mod tests {
         assert!(reply.is_none());
         assert_eq!(
             o.effects,
-            vec![Effect::Inject {
+            vec![Effect::Deliver {
                 session: s,
                 action: Action::Insert,
                 text: "hi".into()
@@ -639,7 +791,7 @@ mod tests {
         );
         assert_eq!(kind(&c), StateKind::Inserting);
 
-        let o = c.handle_internal(Internal::InjectionFinished {
+        let o = c.handle_internal(Internal::DeliveryFinished {
             session: s,
             result: Ok(()),
         });
@@ -675,7 +827,7 @@ mod tests {
         let mut c = Controller::new();
         let s = ready(&mut c, "keep me");
         c.handle_command(Command::Insert);
-        let o = c.handle_internal(Internal::InjectionFinished {
+        let o = c.handle_internal(Internal::DeliveryFinished {
             session: s,
             result: Err("no virtual keyboard".into()),
         });
@@ -688,7 +840,10 @@ mod tests {
             &State::Ready {
                 session: s,
                 result: plain("keep me"),
-                notice: Some("no virtual keyboard".into())
+                notice: Some(Notice {
+                    action: Action::Insert,
+                    failure: "no virtual keyboard".into()
+                })
             }
         );
 
@@ -697,7 +852,7 @@ mod tests {
         assert!(reply.is_none());
         assert!(matches!(
             o.effects[..],
-            [Effect::Inject {
+            [Effect::Deliver {
                 action: Action::Copy,
                 ..
             }]
@@ -709,7 +864,7 @@ mod tests {
         let mut c = Controller::new();
         let s = ready(&mut c, "x");
         c.handle_command(Command::Copy);
-        let o = c.handle_internal(Internal::InjectionFinished {
+        let o = c.handle_internal(Internal::DeliveryFinished {
             session: s + 1,
             result: Ok(()),
         });
@@ -735,10 +890,10 @@ mod tests {
 
         let (_, o) = c.handle_command(Command::InsertRaw);
         assert!(
-            matches!(&o.effects[..], [Effect::Inject { text, action: Action::Insert, .. }] if text == "um clean")
+            matches!(&o.effects[..], [Effect::Deliver { text, action: Action::Insert, .. }] if text == "um clean")
         );
         assert_eq!(c.status().result_chars, Some("um clean".len()));
-        let o = c.handle_internal(Internal::InjectionFinished {
+        let o = c.handle_internal(Internal::DeliveryFinished {
             session: 1,
             result: Err("nope".into()),
         });
@@ -746,8 +901,8 @@ mod tests {
 
         // Back in Ready with both texts; the normal command uses the clean one.
         let (_, o) = c.handle_command(Command::Copy);
-        assert!(matches!(&o.effects[..], [Effect::Inject { text, .. }] if text == "Clean."));
-        let o = c.handle_internal(Internal::InjectionFinished {
+        assert!(matches!(&o.effects[..], [Effect::Deliver { text, .. }] if text == "Clean."));
+        let o = c.handle_internal(Internal::DeliveryFinished {
             session: 1,
             result: Ok(()),
         });
@@ -759,7 +914,7 @@ mod tests {
         // Without a separate raw text, raw commands use the result.
         ready(&mut c, "same");
         let (_, o) = c.handle_command(Command::CopyRaw);
-        assert!(matches!(&o.effects[..], [Effect::Inject { text, .. }] if text == "same"));
+        assert!(matches!(&o.effects[..], [Effect::Deliver { text, .. }] if text == "same"));
     }
 
     #[test]
@@ -773,7 +928,7 @@ mod tests {
         });
         assert_eq!(
             o.effects,
-            vec![Effect::Inject {
+            vec![Effect::Deliver {
                 session: 1,
                 action: Action::Insert,
                 text: "hello".into()
@@ -781,7 +936,7 @@ mod tests {
         );
         assert_eq!(kind(&c), StateKind::Inserting);
 
-        let o = c.handle_internal(Internal::InjectionFinished {
+        let o = c.handle_internal(Internal::DeliveryFinished {
             session: 1,
             result: Ok(()),
         });
@@ -795,7 +950,7 @@ mod tests {
             session: 2,
             result: Ok(plain("again")),
         });
-        c.handle_internal(Internal::InjectionFinished {
+        c.handle_internal(Internal::DeliveryFinished {
             session: 2,
             result: Err("no virtual keyboard".into()),
         });
@@ -835,6 +990,163 @@ mod tests {
         assert_eq!(status.cleanup, Some(CleanupStatus::Failed));
         assert_eq!(status.cleanup_error.as_deref(), Some("cannot reach server"));
         assert_eq!(status.error, None);
+    }
+
+    #[test]
+    fn note_requires_a_hook() {
+        let mut c = Controller::new();
+        let (r, o) = run(&mut c, Command::Note);
+        assert!(!r.ok);
+        assert!(o.effects.is_empty());
+        assert_eq!(kind(&c), StateKind::Idle);
+    }
+
+    #[test]
+    fn note_records_and_delivers_to_the_hook() {
+        // The note goes to the hook even if dictation would insert.
+        let mut c = Controller::with_on_ready(Some(Action::Insert)).with_notes(true);
+        let (r, o) = run(&mut c, Command::Note);
+        assert!(r.ok);
+        assert!(r.status.note);
+        assert_eq!(
+            o.effects,
+            vec![
+                Effect::StartCapture { session: 1 },
+                Effect::ScheduleRecordingLimit { session: 1 }
+            ]
+        );
+        // `toggle`/`stop` end a note recording without changing where it goes.
+        let (_, o) = run(&mut c, Command::Stop);
+        assert_eq!(o.effects, vec![Effect::StartProcessing { session: 1 }]);
+        let (r, _) = run(&mut c, Command::Note);
+        assert!(!r.ok, "still processing");
+        let o = c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Ok(plain("buy milk")),
+        });
+        assert_eq!(
+            o.effects,
+            vec![Effect::Deliver {
+                session: 1,
+                action: Action::Note,
+                text: "buy milk".into()
+            }]
+        );
+        assert!(c.status().note);
+        let o = c.handle_internal(Internal::DeliveryFinished {
+            session: 1,
+            result: Ok(()),
+        });
+        assert_eq!(
+            o.deferred_reply.unwrap().message.as_deref(),
+            Some("note saved")
+        );
+        assert_eq!(kind(&c), StateKind::Idle);
+
+        // Normal dictation afterwards still inserts.
+        run(&mut c, Command::Toggle);
+        assert!(!c.status().note);
+        run(&mut c, Command::Toggle);
+        let o = c.handle_internal(Internal::ProcessingFinished {
+            session: 2,
+            result: Ok(plain("x")),
+        });
+        assert!(matches!(
+            o.effects[..],
+            [Effect::Deliver {
+                action: Action::Insert,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn note_turns_a_dictation_into_a_note() {
+        let mut c = Controller::with_on_ready(Some(Action::Insert)).with_notes(true);
+        run(&mut c, Command::Toggle);
+        let (r, o) = run(&mut c, Command::Note);
+        assert!(r.ok);
+        assert_eq!(o.effects, vec![Effect::StartProcessing { session: 1 }]);
+        let o = c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Ok(plain("idea")),
+        });
+        assert!(matches!(
+            o.effects[..],
+            [Effect::Deliver {
+                action: Action::Note,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn failed_note_keeps_result_and_note_retries() {
+        let mut c = Controller::new().with_notes(true);
+        let s = ready(&mut c, "keep me");
+        // Replies at once: a slow hook must not block the control socket.
+        let (r, o) = run(&mut c, Command::Note);
+        assert!(r.ok);
+        assert!(matches!(
+            o.effects[..],
+            [Effect::Deliver {
+                action: Action::Note,
+                ..
+            }]
+        ));
+        let o = c.handle_internal(Internal::DeliveryFinished {
+            session: s,
+            result: Err(Failure {
+                message: "note hook exited with status 1".into(),
+                detail: Some("cannot append secret words".into()),
+            }),
+        });
+        let reply = o.deferred_reply.unwrap();
+        assert!(!reply.ok);
+        // The hook's stderr may contain the note; it stays out of status.
+        assert!(!serde_json::to_string(&reply).unwrap().contains("secret"));
+        assert_eq!(
+            c.status().error.as_deref(),
+            Some("note hook exited with status 1")
+        );
+        assert!(matches!(
+            c.state(),
+            State::Ready {
+                notice: Some(Notice {
+                    action: Action::Note,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let (_, o) = run(&mut c, Command::Note);
+        assert!(matches!(
+            &o.effects[..],
+            [Effect::Deliver { action: Action::Note, text, .. }] if text == "keep me"
+        ));
+    }
+
+    #[test]
+    fn running_note_hook_can_be_cancelled_but_not_typing() {
+        let mut c = Controller::new().with_notes(true);
+        let s = ready(&mut c, "x");
+        run(&mut c, Command::Note);
+        let (r, o) = run(&mut c, Command::Cancel);
+        assert!(r.ok);
+        assert_eq!(o.effects, vec![Effect::AbortDelivery { session: s }]);
+        assert_eq!(kind(&c), StateKind::Idle);
+        // The killed hook's result is ignored.
+        let o = c.handle_internal(Internal::DeliveryFinished {
+            session: s,
+            result: Err("killed".into()),
+        });
+        assert!(!o.changed);
+        assert_eq!(kind(&c), StateKind::Idle);
+
+        ready(&mut c, "y");
+        c.handle_command(Command::Insert);
+        let (r, _) = run(&mut c, Command::Cancel);
+        assert!(!r.ok);
     }
 
     #[test]

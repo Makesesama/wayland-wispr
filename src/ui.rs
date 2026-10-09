@@ -12,8 +12,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::cleanup::CleanupStatus;
 use crate::config::{Config, InsertMethod, OnReady, OverlayConfig, OverlayLayer, Side};
-use crate::controller::{SessionId, State};
-use crate::injection::Action;
+use crate::controller::{Action, Notice, SessionId, State};
 use crate::theme;
 
 const APP_ID: &str = "de.makussu.WaylandWispr";
@@ -65,6 +64,8 @@ window.wispr {{
 .processing .dot {{ background-color: #f5c542; }}
 .ready .dot {{ background-color: #4dd28a; }}
 .error .dot {{ background-color: #ff7a45; }}
+/* `wayland-wispr note` sessions also carry `.note`. */
+.note.recording .dot {{ background-color: #4da3ff; }}
 /* Step indicator: one segment per step (transcribe, polish, insert/copy). */
 .step {{
   min-width: {step_w};
@@ -88,6 +89,7 @@ spinner.busy {{ color: #f5c542; min-width: {spin}; min-height: {spin}; }}
 .status {{ font-weight: bold; }}
 /* Bars are drawn in the widget's foreground colour. */
 .wave {{ color: #ff4d4d; }}
+.note .wave {{ color: #4da3ff; }}
 .time {{ font-feature-settings: "tnum"; opacity: 0.75; }}
 .detail {{ opacity: 0.75; }}
 "#,
@@ -173,14 +175,15 @@ impl StepState {
     }
 }
 
-/// Steps a session goes through after recording, given the config. Cleanup
-/// that turns out to be skipped (short transcript) simply shows as done.
-fn plan(config: &Config) -> Vec<Step> {
+/// Steps a session goes through after recording, given the config; notes
+/// always end with the hook. Cleanup that turns out to be skipped (short
+/// transcript) simply shows as done.
+fn plan(config: &Config, note: bool) -> Vec<Step> {
     let mut steps = vec![Step::Transcribe];
     if config.cleanup.enabled {
         steps.push(Step::Polish);
     }
-    if config.injection.on_ready != OnReady::None {
+    if note || config.injection.on_ready != OnReady::None {
         steps.push(Step::Deliver);
     }
     steps
@@ -205,13 +208,16 @@ pub enum View {
     Hidden,
     Recording {
         session: SessionId,
+        /// Goes to the note hook.
+        note: bool,
     },
     Processing {
         session: SessionId,
+        note: bool,
     },
     Ready {
         preview: String,
-        notice: Option<String>,
+        notice: Option<Notice>,
         /// Cleanup failed; the result is the raw transcript.
         uncleaned: bool,
     },
@@ -227,8 +233,14 @@ impl From<&State> for View {
     fn from(state: &State) -> Self {
         match state {
             State::Idle => View::Hidden,
-            State::Recording { session } => View::Recording { session: *session },
-            State::Processing { session } => View::Processing { session: *session },
+            State::Recording { session, on_ready } => View::Recording {
+                session: *session,
+                note: *on_ready == Some(Action::Note),
+            },
+            State::Processing { session, on_ready } => View::Processing {
+                session: *session,
+                note: *on_ready == Some(Action::Note),
+            },
             State::Ready { result, notice, .. } => View::Ready {
                 preview: preview(&result.text),
                 notice: notice.clone(),
@@ -238,6 +250,16 @@ impl From<&State> for View {
             State::Error { message, .. } => View::Error {
                 message: message.clone(),
             },
+        }
+    }
+}
+
+impl View {
+    fn is_note(&self) -> bool {
+        match self {
+            View::Recording { note, .. } | View::Processing { note, .. } => *note,
+            View::Inserting { action } => *action == Action::Note,
+            _ => false,
         }
     }
 }
@@ -357,6 +379,10 @@ struct Overlay {
     /// Step indicator container and one segment per planned step.
     steps: gtk4::Box,
     plan: Vec<Step>,
+    /// Steps of a note session; never shorter than `plan`.
+    note_plan: Vec<Step>,
+    /// The session shown is a note (kept through the "Note saved" confirmation).
+    note: Cell<bool>,
     detail: gtk4::Label,
     wave_area: gtk4::DrawingArea,
     wave: Rc<RefCell<Wave>>,
@@ -430,6 +456,8 @@ impl Overlay {
             "Copying…",
             "Copied",
             "Inserted",
+            "Saving note…",
+            "Note saved",
         ] {
             add_status_page(&status, text);
         }
@@ -453,12 +481,13 @@ impl Overlay {
         // Room for the longest possible time, so the counter never resizes.
         time.set_width_chars(format_elapsed(config.recording.max_seconds).len() as i32);
 
-        let plan = plan(config);
+        let note_plan = plan(config, true);
+        let plan = plan(config, false);
         let steps = gtk4::Box::new(gtk4::Orientation::Horizontal, scaled(4.0, scale));
         steps.add_css_class("steps");
         steps.set_halign(gtk4::Align::End);
         steps.set_valign(gtk4::Align::Center);
-        for _ in &plan {
+        for _ in &note_plan {
             let segment = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
             segment.add_css_class("step");
             segment.set_valign(gtk4::Align::Center);
@@ -512,6 +541,8 @@ impl Overlay {
             headline,
             steps,
             plan,
+            note_plan,
+            note: Cell::new(false),
             detail,
             wave_area,
             wave,
@@ -536,8 +567,14 @@ impl Overlay {
             id.remove();
         }
         let previous = self.last.replace(view.clone());
-        for class in ["recording", "processing", "ready", "error"] {
+        for class in ["recording", "processing", "ready", "error", "note"] {
             self.pill.remove_css_class(class);
+        }
+        if view.is_note() {
+            self.pill.add_css_class("note");
+        }
+        if *view != View::Hidden {
+            self.note.set(view.is_note());
         }
         self.recording_since.set(None);
         self.recording_session.set(None);
@@ -576,6 +613,7 @@ impl Overlay {
                     match action {
                         Action::Copy => "Copied",
                         Action::Insert => "Inserted",
+                        Action::Note => "Note saved",
                     },
                 );
                 self.detail.set_visible(false);
@@ -592,7 +630,7 @@ impl Overlay {
                     }));
                 return;
             }
-            View::Recording { session } => {
+            View::Recording { session, .. } => {
                 self.recording_since.set(Some(Instant::now()));
                 self.recording_session.set(Some(*session));
                 self.time.set_text(&format_elapsed(0));
@@ -601,7 +639,7 @@ impl Overlay {
                 // No status text: dot, waveform, and time say enough.
                 ("recording", "", String::new())
             }
-            View::Processing { session } => {
+            View::Processing { session, .. } => {
                 self.processing_session.set(Some(*session));
                 self.show_steps(Some(Step::Transcribe));
                 ("processing", Stage::Transcribing.label(), String::new())
@@ -609,7 +647,19 @@ impl Overlay {
             View::Ready {
                 notice: Some(notice),
                 ..
-            } => ("error", "Insert failed", notice.clone()),
+            } => {
+                let headline = match notice.action {
+                    Action::Copy => "Copy failed",
+                    Action::Insert => "Insert failed",
+                    Action::Note => "Note failed",
+                };
+                let failure = &notice.failure;
+                let detail = match &failure.detail {
+                    Some(detail) => format!("{}: {detail}", failure.message),
+                    None => failure.message.clone(),
+                };
+                ("error", headline, detail)
+            }
             View::Ready {
                 preview,
                 uncleaned: true,
@@ -621,6 +671,7 @@ impl Overlay {
                 let label = match action {
                     Action::Copy => "Copying…",
                     Action::Insert => self.insert_label,
+                    Action::Note => "Saving note…",
                 };
                 ("processing", label, String::new())
             }
@@ -729,19 +780,30 @@ impl Overlay {
     /// single step is not worth showing, nor a step that is not planned
     /// (e.g. a manual `insert` with `on_ready = "none"`).
     fn show_steps(&self, current: Option<Step>) {
-        let planned = current.is_none_or(|step| self.plan.contains(&step));
-        if self.plan.len() < 2 || !planned {
+        let plan = if self.note.get() {
+            &self.note_plan
+        } else {
+            &self.plan
+        };
+        let planned = current.is_none_or(|step| plan.contains(&step));
+        if plan.len() < 2 || !planned {
             self.steps.set_visible(false);
             return;
         }
-        let states = step_states(&self.plan, current);
+        let mut states = step_states(plan, current).into_iter();
         let mut child = self.steps.first_child();
-        for state in states {
-            let Some(segment) = child else { break };
+        while let Some(segment) = child {
             for class in ["done", "active", "pending"] {
                 segment.remove_css_class(class);
             }
-            segment.add_css_class(state.css_class());
+            // Segments beyond this plan (a note's extra step) are hidden.
+            match states.next() {
+                Some(state) => {
+                    segment.add_css_class(state.css_class());
+                    segment.set_visible(true);
+                }
+                None => segment.set_visible(false),
+            }
             child = segment.next_sibling();
         }
         self.steps.set_visible(true);
@@ -922,14 +984,16 @@ mod tests {
         config.cleanup.enabled = true;
         config.injection.on_ready = OnReady::Insert;
         assert_eq!(
-            plan(&config),
+            plan(&config, false),
             [Step::Transcribe, Step::Polish, Step::Deliver]
         );
         config.cleanup.enabled = false;
         config.injection.on_ready = OnReady::Copy;
-        assert_eq!(plan(&config), [Step::Transcribe, Step::Deliver]);
+        assert_eq!(plan(&config, false), [Step::Transcribe, Step::Deliver]);
         config.injection.on_ready = OnReady::None;
-        assert_eq!(plan(&config), [Step::Transcribe]);
+        assert_eq!(plan(&config, false), [Step::Transcribe]);
+        // Notes always run the hook.
+        assert_eq!(plan(&config, true), [Step::Transcribe, Step::Deliver]);
     }
 
     #[test]

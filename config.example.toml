@@ -80,6 +80,14 @@ paste_chord = "ctrl+v"     # method = "paste" only; terminals: "ctrl+shift+v"
 pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert
 key_delay_ms = 10
 
+[note]
+# `wayland-wispr note`: record like `toggle`, but pipe the (cleaned) transcript
+# into this executable on stdin instead of typing it. Any language works; the
+# script decides where the note goes (a file, a notes app, an upload, …).
+# Relative paths are relative to this file; ~/ is the home directory.
+# hook = "note.sh"        # gets the text on stdin; exit 0 = saved
+timeout_secs = 30          # the hook is killed after this long
+
 [debug]
 fake_processing_ms = 1500  # duration of the "fake" transcription backend
 # save_recordings_dir = "/path"  # debug only: save every recording as WAV

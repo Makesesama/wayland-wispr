@@ -7,6 +7,7 @@ mod config;
 mod controller;
 mod injection;
 mod ipc;
+mod note;
 mod probe;
 mod theme;
 mod transcription;
@@ -61,6 +62,10 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// Take a note: start recording, or stop and pipe the result into the
+    /// `note.hook` script instead of typing it. With a ready result (e.g.
+    /// after a failed hook), pipe that.
+    Note,
     /// Clean up a text with the configured LLM (argument or stdin) and print
     /// the result; timing and outcome go to stderr. Works with cleanup disabled.
     Cleanup {
@@ -253,6 +258,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Copy { raw: true } => Command::CopyRaw,
         Cmd::Insert { raw: false } => Command::Insert,
         Cmd::Insert { raw: true } => Command::InsertRaw,
+        Cmd::Note => Command::Note,
     };
 
     let response = ipc::send(&ipc::socket_path()?, command)?;
@@ -306,6 +312,9 @@ fn check_config(config: &Config) {
     for path in config.overlay.theme.iter().flat_map(|t| t.paths()) {
         let state = if path.is_file() { "ok" } else { "missing" };
         println!("theme: {} ({state})", path.display());
+    }
+    if let Some(hook) = &config.note.hook {
+        println!("note hook: {} ({})", hook.display(), note::check(hook));
     }
     if config.transcription.backend != TranscriptionBackend::Whisper {
         return;

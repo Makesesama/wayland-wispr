@@ -9,8 +9,9 @@ use anyhow::{Context, bail};
 use crate::audio::{self, Capture, CaptureEvent};
 use crate::cleanup::{Cleaner, Processed};
 use crate::config::Config;
-use crate::controller::{Command, Controller, Effect, Internal, Reply, SessionId};
+use crate::controller::{Action, Command, Controller, Effect, Internal, Reply, SessionId};
 use crate::injection::Injector;
+use crate::note::{self, NoteHook};
 use crate::transcription::{
     CancelFlag, Progress, TranscribeError, Transcriber, strip_hallucinations,
 };
@@ -30,6 +31,16 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     let injector = Arc::new(Injector::new(&config.injection).context("preparing text insertion")?);
     let transcriber = Arc::new(Transcriber::new(&config).context("setting up transcription")?);
     let cleaner = Arc::new(Cleaner::new(&config.cleanup).context("setting up cleanup")?);
+    let note_hook = NoteHook::new(&config).map(Arc::new);
+    if let Some(hook) = &note_hook {
+        // Not fatal: the script may appear later; `note` reports failures.
+        match note::check(hook.path()) {
+            "ok" => tracing::info!(hook = %hook.path().display(), "note hook configured"),
+            problem => {
+                tracing::warn!(hook = %hook.path().display(), problem, "note hook cannot be run")
+            }
+        }
+    }
 
     let socket = ipc::socket_path()?;
     let (listener, socket_guard) = ipc::bind(&socket)?;
@@ -48,8 +59,10 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                 injector,
                 transcriber,
                 cleaner,
+                note_hook,
                 capture: None,
                 processing: None,
+                delivering: None,
             };
             move || runtime.run(msg_rx)
         })
@@ -109,15 +122,19 @@ struct Runtime {
     injector: Arc<Injector>,
     transcriber: Arc<Transcriber>,
     cleaner: Arc<Cleaner>,
+    note_hook: Option<Arc<NoteHook>>,
     /// The microphone capture of the current recording session, if any.
     capture: Option<(SessionId, Capture)>,
     /// Cancellation handle of the session being processed, if any.
     processing: Option<(SessionId, CancelFlag)>,
+    /// Cancellation handle of a running note hook, if any.
+    delivering: Option<(SessionId, CancelFlag)>,
 }
 
 impl Runtime {
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
-        let mut controller = Controller::with_on_ready(self.config.injection.on_ready.action());
+        let mut controller = Controller::with_on_ready(self.config.injection.on_ready.action())
+            .with_notes(self.note_hook.is_some());
         // Reply channel of the one copy/insert command awaiting completion.
         // The controller rejects further copy/insert commands until then.
         let mut pending: Option<mpsc::SyncSender<Reply>> = None;
@@ -230,19 +247,40 @@ impl Runtime {
                     }
                 }
             }
-            Effect::Inject {
+            Effect::Deliver {
                 session,
                 action,
                 text,
             } => {
                 let injector = self.injector.clone();
-                self.spawn("inject", move || {
-                    let result = injector.run(action, &text);
+                let note_hook = self.note_hook.clone();
+                let cancel = CancelFlag::default();
+                self.delivering = Some((session, cancel.clone()));
+                self.spawn("deliver", move || {
+                    let result = match action {
+                        Action::Copy => injector.copy(&text).map_err(Into::into),
+                        Action::Insert => injector.insert(&text).map_err(Into::into),
+                        // The controller only accepts `note` with a hook.
+                        Action::Note => match note_hook {
+                            Some(hook) => hook.run(session, &text, &cancel),
+                            None => Err("no note hook configured".into()),
+                        },
+                    };
                     if let Err(e) = &result {
-                        tracing::warn!(session, ?action, error = %e, "injection failed");
+                        // Only our message: the detail may contain the note.
+                        tracing::warn!(session, ?action, error = %e.message, "delivery failed");
                     }
-                    Internal::InjectionFinished { session, result }
+                    Internal::DeliveryFinished { session, result }
                 });
+            }
+            Effect::AbortDelivery { session } => {
+                if let Some((s, cancel)) = self.delivering.take() {
+                    if s == session {
+                        cancel.cancel();
+                    } else {
+                        self.delivering = Some((s, cancel));
+                    }
+                }
             }
         }
     }

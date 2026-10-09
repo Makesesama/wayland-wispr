@@ -10,6 +10,8 @@ implemented; see the checklist. The API transcription backend is still planned.
 See [RESEARCH.md](RESEARCH.md) for native-library research, source links, and
 remaining uncertainties. Runtime subprocess helpers and X11/uinput compatibility
 workarounds are out of scope for now; target the native river/Wayland protocols.
+The one subprocess is the user's own note hook (`note.hook`), an explicit
+output target rather than a workaround.
 
 Build a Wispr Flow-like dictation app for Wayland:
 
@@ -264,6 +266,16 @@ Stage failure → Error (with recoverable transcript/result where available)
   results that cannot be interrupted.
 - Separate processing from insertion so retries do not duplicate pasted text.
   Never automatically retry an input action whose delivery is uncertain.
+- Each recording carries its delivery (`on_ready`): the configured
+  `injection.on_ready` for `toggle`/`start`, the note hook for `note`.
+  Copy, insert and note share the `Inserting` state and its Ready-with-notice
+  recovery; a failed note hook is retried with another `note`.
+- The note hook (`src/note.rs`) is executed directly (no shell) in its own
+  process group with the result on stdin, a timeout, bounded stderr capture,
+  and stdout discarded. Timeout and `cancel` kill the whole group. `note` on
+  a Ready result replies immediately instead of deferring, so a slow hook
+  never blocks the control socket. Hook stderr is overlay-only detail
+  (`Failure::detail`), never part of `status`.
 - On shutdown: stop capture, cancel workers, close IPC, remove only the socket
   owned by this process, and release transient audio/text buffers.
 
@@ -345,7 +357,8 @@ paste_chord = "Ctrl+V" # application-level syntax to define during implementatio
   and explain that dropping buffers is not a guarantee of forensic erasure.
   Any debug export must be opt-in and use private files.
 - Do not collect telemetry. Log state, timings, and error categories, not audio,
-  transcripts, clipboard contents, or secrets.
+  transcripts, clipboard contents, or secrets. Exception: the note hook's own
+  stderr is logged, since the user's script decides what it prints.
 
 ## Phased implementation checklist
 

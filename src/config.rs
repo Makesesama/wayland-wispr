@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::injection::Action;
+use crate::controller::Action;
 pub use crate::injection::typing::Newline;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +33,7 @@ pub struct Config {
     pub transcription: TranscriptionConfig,
     pub cleanup: CleanupConfig,
     pub injection: InjectionConfig,
+    pub note: NoteConfig,
     pub debug: DebugConfig,
 }
 
@@ -475,6 +476,28 @@ pub enum InsertMethod {
     Paste,
 }
 
+/// `wayland-wispr note`: the result goes to a user script instead of the
+/// focused application.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NoteConfig {
+    /// Executable that gets the (cleaned) transcript on stdin. Relative
+    /// paths are resolved against the config file's directory, `~/` against
+    /// the home directory. Unset: `note` is unavailable.
+    pub hook: Option<PathBuf>,
+    /// The hook is killed after this many seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for NoteConfig {
+    fn default() -> Self {
+        Self {
+            hook: None,
+            timeout_secs: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DebugConfig {
@@ -526,6 +549,28 @@ impl Config {
         config.validate()?;
         let base = path.parent().unwrap_or(Path::new("."));
         let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
+        if config
+            .note
+            .hook
+            .as_ref()
+            .and_then(|h| h.to_str())
+            .is_some_and(|h| h.starts_with('~') && h != "~" && !h.starts_with("~/"))
+        {
+            return Err(ConfigError::Invalid(
+                "note.hook: only `~/` is expanded, not `~user/`".into(),
+            ));
+        }
+        if let Some(hook) = &mut config.note.hook
+            && let Ok(rest) = hook.strip_prefix("~").map(Path::to_path_buf)
+        {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|h| h.is_absolute())
+                .ok_or_else(|| {
+                    ConfigError::Invalid("note.hook starts with `~/` but HOME is not set".into())
+                })?;
+            *hook = home.join(rest);
+        }
         let theme_paths = config
             .overlay
             .theme
@@ -537,6 +582,7 @@ impl Config {
             &mut config.transcription.whisper.models_dir,
             &mut config.transcription.whisper.model_path,
             &mut config.cleanup.prompt_file,
+            &mut config.note.hook,
         ]
         .into_iter()
         .flatten()
@@ -667,6 +713,21 @@ impl Config {
             ));
         }
         self.validate_cleanup()?;
+        if self
+            .note
+            .hook
+            .as_ref()
+            .is_some_and(|h| h.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "note.hook must not be empty; omit it to disable notes".into(),
+            ));
+        }
+        if !(1..=3600).contains(&self.note.timeout_secs) {
+            return Err(ConfigError::Invalid(
+                "note.timeout_secs must be between 1 and 3600".into(),
+            ));
+        }
         if self.debug.fake_processing_ms > 60_000 {
             return Err(ConfigError::Invalid(
                 "debug.fake_processing_ms must be at most 60000".into(),
@@ -1008,6 +1069,34 @@ mod tests {
         assert!(is_loopback_host("127.0.0.2"));
         assert!(is_loopback_host("LOCALHOST"));
         assert!(!is_loopback_host("10.0.0.1"));
+    }
+
+    #[test]
+    fn parses_and_resolves_note_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[note]\nhook = \"note.sh\"\ntimeout_secs = 5").unwrap();
+        let c = Config::load(Some(&path)).unwrap();
+        assert_eq!(c.note.hook, Some(dir.path().join("note.sh")));
+        assert_eq!(c.note.timeout_secs, 5);
+
+        std::fs::write(&path, "[note]\nhook = \"/abs/note.py\"").unwrap();
+        let c = Config::load(Some(&path)).unwrap();
+        assert_eq!(c.note.hook, Some(PathBuf::from("/abs/note.py")));
+
+        if let Some(home) = std::env::var_os("HOME").filter(|h| Path::new(h).is_absolute()) {
+            std::fs::write(&path, "[note]\nhook = \"~/bin/note\"").unwrap();
+            let c = Config::load(Some(&path)).unwrap();
+            assert_eq!(c.note.hook, Some(PathBuf::from(home).join("bin/note")));
+        }
+
+        for bad in ["[note]\nhook = \"\"", "[note]\ntimeout_secs = 0"] {
+            let c: Config = toml::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>("[note]\nscript = \"x\"").is_err());
+        std::fs::write(&path, "[note]\nhook = \"~alice/note.sh\"").unwrap();
+        assert!(Config::load(Some(&path)).is_err());
     }
 
     #[test]
