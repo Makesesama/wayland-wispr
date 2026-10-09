@@ -4,7 +4,8 @@
 
 [overlay]
 layer = "overlay"
-margin_bottom = 48
+position = "bottom"
+margin = 48
 
 [recording]
 max_seconds = 120

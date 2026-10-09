@@ -14,7 +14,7 @@ use crate::injection::Injector;
 use crate::transcription::{
     CancelFlag, Progress, TranscribeError, Transcriber, strip_hallucinations,
 };
-use crate::ui::{UiEvent, View};
+use crate::ui::{Stage, UiEvent, View};
 use crate::{ipc, probe, ui};
 
 /// Covers copy/insert, which reply only after the text was typed/pasted.
@@ -291,11 +291,11 @@ fn process(
     let progress = Box::new({
         let ui = ui.clone();
         move |stage| {
-            let label = match stage {
-                Progress::LoadingModel => "Loading model…",
-                Progress::Transcribing => "Transcribing…",
+            let stage = match stage {
+                Progress::LoadingModel => Stage::LoadingModel,
+                Progress::Transcribing => Stage::Transcribing,
             };
-            let _ = ui.try_send(UiEvent::Stage { session, label });
+            let _ = ui.try_send(UiEvent::Stage { session, stage });
         }
     });
     let transcript = match transcriber.transcribe(&clip, cancel, progress) {
@@ -323,7 +323,7 @@ fn process(
         .run(raw, cancel, || {
             let _ = ui.try_send(UiEvent::Stage {
                 session,
-                label: "Polishing…",
+                stage: Stage::Polishing,
             });
         })
         .map_err(|_| {

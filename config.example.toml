@@ -1,8 +1,15 @@
 # Copy to $XDG_CONFIG_HOME/wayland-wispr/config.toml. All keys are optional.
 
 [overlay]
-layer = "overlay"   # or "top"
-margin_bottom = 48  # logical pixels from the bottom edge
+layer = "overlay"     # or "top"
+position = "bottom"   # top-left | top | top-right | left | center | right
+                      # | bottom-left | bottom | bottom-right
+margin = 48           # logical pixels from the anchored edge(s)
+# margin_x = 16       # override for the left/right edge
+# margin_y = 48       # override for the top/bottom edge
+# output = "DP-1"     # connector name; default: the compositor chooses
+scale = 1.0           # size of the pill (0.5-4); margins are not scaled
+opacity = 0.88        # pill background (0 = transparent, 1 = opaque); text stays opaque
 
 [recording]
 max_seconds = 120   # recording stops automatically after this

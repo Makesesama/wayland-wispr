@@ -26,7 +26,7 @@ cargo run -- run              # resident process + overlay (needs wlr layer-shel
 # from another terminal / a WM keybinding:
 wayland-wispr toggle          # start recording / stop, process, copy + type into focused field
 wayland-wispr start | stop    # push-to-talk press / release
-wayland-wispr cancel          # discard recording, processing, or ready result
+wayland-wispr cancel          # discard recording, processing, or ready result (alias: abort)
 wayland-wispr status          # JSON state (never contains transcript text)
 wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
@@ -49,7 +49,7 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/app.rs` | Resident process: controller thread, IPC thread, effect workers |
 | `src/controller.rs` | Pure session state machine with session IDs (unit-tested) |
 | `src/ipc.rs` | Versioned, size-bounded JSON-line Unix socket protocol |
-| `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0) |
+| `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0, click-through; configurable position/output; waveform + elapsed time while recording) |
 | `src/probe.rs` | Native `wayland-client` global probe on its own connection |
 | `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
 | `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` direct typing and paste chord (`wayland-protocols-misc`) |
@@ -214,7 +214,7 @@ services.wayland-wispr = {
   WAYLAND_DISPLAY` from the river init). A config or model change restarts it.
   Secrets for `cleanup.api_key_env` go in `environmentFile`, never `settings`.
   The module does not run Ollama; use `services.ollama` on the system.
-- Bind `wayland-wispr toggle`, `insert`, and `cancel` in the WM. The package is
+- Bind `wayland-wispr toggle`, `insert`, and `cancel` (or its alias `abort`) in the WM. The package is
   added to `home.packages`.
 
 ### Ollama for LLM cleanup

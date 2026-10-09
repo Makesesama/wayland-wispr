@@ -44,6 +44,7 @@ enum Cmd {
     /// Stop recording and process it (e.g. push-to-talk key release).
     Stop,
     /// Discard the active recording, processing, or ready result.
+    #[command(visible_alias = "abort")]
     Cancel,
     /// Print machine-readable state of the running instance as JSON.
     Status,

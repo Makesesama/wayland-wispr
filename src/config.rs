@@ -41,15 +41,86 @@ pub struct Config {
 pub struct OverlayConfig {
     /// Layer-shell layer for the indicator.
     pub layer: OverlayLayer,
-    /// Distance from the bottom screen edge in logical pixels.
-    pub margin_bottom: i32,
+    /// Where on the output the indicator sits.
+    pub position: OverlayPosition,
+    /// Gap to the anchored screen edge(s) in logical pixels.
+    pub margin: i32,
+    /// Horizontal gap override (left/right edges).
+    pub margin_x: Option<i32>,
+    /// Vertical gap override (top/bottom edges).
+    pub margin_y: Option<i32>,
+    /// Output connector name (e.g. `DP-1`); unset lets the compositor choose.
+    pub output: Option<String>,
+    /// Size multiplier for the pill (text, padding, waveform); not margins.
+    pub scale: f64,
+    /// Opacity of the pill background (0 = transparent, 1 = opaque); text
+    /// and indicators stay fully opaque.
+    pub opacity: f64,
 }
 
 impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             layer: OverlayLayer::Overlay,
-            margin_bottom: 48,
+            position: OverlayPosition::Bottom,
+            margin: 48,
+            margin_x: None,
+            margin_y: None,
+            output: None,
+            scale: 1.0,
+            opacity: 0.88,
+        }
+    }
+}
+
+impl OverlayConfig {
+    pub fn margin_x(&self) -> i32 {
+        self.margin_x.unwrap_or(self.margin)
+    }
+
+    pub fn margin_y(&self) -> i32 {
+        self.margin_y.unwrap_or(self.margin)
+    }
+}
+
+/// Nine-point placement on the output.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverlayPosition {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+/// Vertical/horizontal screen edge a position is anchored to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Start,
+    Middle,
+    End,
+}
+
+impl OverlayPosition {
+    /// (horizontal, vertical) anchoring: `Start` = left/top, `End` = right/bottom.
+    pub fn sides(self) -> (Side, Side) {
+        use OverlayPosition::*;
+        use Side::*;
+        match self {
+            TopLeft => (Start, Start),
+            Top => (Middle, Start),
+            TopRight => (End, Start),
+            Left => (Start, Middle),
+            Center => (Middle, Middle),
+            Right => (End, Middle),
+            BottomLeft => (Start, End),
+            Bottom => (Middle, End),
+            BottomRight => (End, End),
         }
     }
 }
@@ -434,9 +505,30 @@ impl Config {
                 "recording.max_seconds must be between 1 and 3600".into(),
             ));
         }
-        if !(0..=2000).contains(&self.overlay.margin_bottom) {
+        for (key, value) in [
+            ("margin", Some(self.overlay.margin)),
+            ("margin_x", self.overlay.margin_x),
+            ("margin_y", self.overlay.margin_y),
+        ] {
+            if value.is_some_and(|v| !(0..=2000).contains(&v)) {
+                return Err(ConfigError::Invalid(format!(
+                    "overlay.{key} must be between 0 and 2000"
+                )));
+            }
+        }
+        if !(0.5..=4.0).contains(&self.overlay.scale) {
             return Err(ConfigError::Invalid(
-                "overlay.margin_bottom must be between 0 and 2000".into(),
+                "overlay.scale must be between 0.5 and 4".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.overlay.opacity) {
+            return Err(ConfigError::Invalid(
+                "overlay.opacity must be between 0 and 1".into(),
+            ));
+        }
+        if self.overlay.output.as_deref().is_some_and(str::is_empty) {
+            return Err(ConfigError::Invalid(
+                "overlay.output must not be empty; omit it to let the compositor choose".into(),
             ));
         }
         if let Err(e) = self
@@ -624,13 +716,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.overlay.layer, OverlayLayer::Top);
-        assert_eq!(c.overlay.margin_bottom, 48);
+        assert_eq!(c.overlay.position, OverlayPosition::Bottom);
+        assert_eq!(c.overlay.margin_y(), 48);
         assert_eq!(c.max_recording(), Duration::from_secs(30));
     }
 
     #[test]
     fn rejects_unknown_keys_and_bad_values() {
         assert!(toml::from_str::<Config>("[overlay]\nfoo = 1").is_err());
+        assert!(toml::from_str::<Config>("[overlay]\nmargin_bottom = 48").is_err());
+        assert!(toml::from_str::<Config>("[overlay]\nposition = \"middle\"").is_err());
+        let c: Config = toml::from_str("[overlay]\nmargin_x = -1").unwrap();
+        assert!(c.validate().is_err());
+        let c: Config = toml::from_str("[overlay]\noutput = \"\"").unwrap();
+        assert!(c.validate().is_err());
+        let c: Config = toml::from_str(
+            "[overlay]\nposition = \"top-right\"\nmargin = 10\nmargin_y = 30\noutput = \"DP-1\"",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.overlay.position.sides(), (Side::End, Side::Start));
+        assert_eq!((c.overlay.margin_x(), c.overlay.margin_y()), (10, 30));
+        let c: Config = toml::from_str("[overlay]\nscale = 2").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.overlay.scale, 2.0);
+        let c: Config = toml::from_str("[overlay]\nscale = 1.25").unwrap();
+        c.validate().unwrap();
+        let c: Config = toml::from_str("[overlay]\nopacity = 0").unwrap();
+        c.validate().unwrap();
+        for bad in ["-0.1", "1.5", "nan"] {
+            let c: Config = toml::from_str(&format!("[overlay]\nopacity = {bad}")).unwrap();
+            assert!(c.validate().is_err(), "opacity = {bad}");
+        }
+        for bad in ["0.1", "5.0", "nan"] {
+            let c: Config = toml::from_str(&format!("[overlay]\nscale = {bad}")).unwrap();
+            assert!(c.validate().is_err(), "scale = {bad}");
+        }
         let c: Config = toml::from_str("[recording]\nmax_seconds = 0").unwrap();
         assert!(c.validate().is_err());
         let c: Config = toml::from_str("[injection]\npaste_chord = \"meta+v\"").unwrap();

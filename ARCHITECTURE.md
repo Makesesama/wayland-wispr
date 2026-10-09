@@ -52,15 +52,31 @@ features to keep native local-model and future GPU dependencies optional.
 The resident process owns a GTK application and a small layer-shell window:
 
 - Use `Layer::Overlay` (or `Top` if testing shows better behavior).
-- Bottom-center is the initial placement; make anchor/margins configurable later.
+- The pill is a `CenterBox` with a fixed width: dot/spinner at the start,
+  waveform (recording) or status text (busy) in the true centre, and time or
+  steps at the end. Each part is a `Stack` sized to its largest page, and the pill's width is measured
+  once at startup. Only Ready/Error may grow, for their preview/message.
+  `overlay.scale` multiplies all CSS sizes and the waveform geometry;
+  `overlay.opacity` sets only the pill background's alpha.
+- Placement is configurable: `overlay.position` (nine-point anchor), `margin`/
+  `margin_x`/`margin_y`, and `output` (connector name, resolved before each show).
+- The overlay is click-through (empty input region) and has no buttons; aborting
+  is the `cancel`/`abort` command, bound in the WM.
 - Use `KeyboardMode::None`: the indicator must not acquire keyboard focus.
 - Set exclusive zone to zero: do not reserve desktop space.
 - Idle: hidden. Recording: visible activity and elapsed time. Processing: busy
   state. Ready/error: brief status with a manual recovery path.
 - Keep GTK objects on the main thread. Send owned data/events from workers to
   the GLib main context; do not update GTK widgets from Tokio tasks.
-- Begin with text/status indicators; waveforms, translucency, and animations
-  are polish, not prerequisites.
+- Recording shows a scrolling waveform (one bar per 50 ms level report) and an
+  up-counting elapsed time; there is deliberately no countdown to `max_seconds`.
+- Transcribing/polishing/inserting show a spinner in place of the status dot,
+  plus a step indicator (one segment each for transcribe, polish if
+  `cleanup.enabled`, and insert/copy unless `on_ready = "none"`; hidden with a
+  single step). Workers report a typed `ui::Stage`, not label strings.
+  A successful insert or copy briefly shows "Inserted"/"Copied" before hiding.
+  Showing and hiding fade the window opacity; both the fade and CSS
+  transitions follow GTK's `gtk-enable-animations` setting.
 
 Check layer-shell support at startup and show a clear unsupported error.
 Do not add alternate GUI workarounds now. GNOME/Mutter does not provide wlr layer shell.
@@ -495,7 +511,9 @@ build remains usable without local inference enabled.
 - [x] Add optional user-service/Home Manager integration without requiring root
       (`nix/service.nix`).
 - [ ] Exercise x86_64/aarch64 builds and test the intended host/compositor matrix.
-- [ ] Improve device selection/settings/errors; add waveform/animation afterward.
+- [x] Waveform and elapsed time while recording; configurable position.
+- [x] Busy spinner, insert/copy confirmation, fade in/out.
+- [ ] Improve device selection/settings/errors.
 - [ ] Evaluate VAD, clipboard preservation, GPU acceleration, and portal shortcuts
       separately, based on measured needs. Alternate compatibility/workaround
       injection backends remain out of scope unless explicitly requested.
