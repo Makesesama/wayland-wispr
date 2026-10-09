@@ -26,6 +26,7 @@ pub enum ConfigError {
 pub struct Config {
     pub overlay: OverlayConfig,
     pub recording: RecordingConfig,
+    pub audio: AudioConfig,
     pub injection: InjectionConfig,
     pub debug: DebugConfig,
 }
@@ -70,6 +71,30 @@ impl Default for RecordingConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct AudioConfig {
+    /// cpal host: `auto` (PipeWire if available, else ALSA), `pipewire`, `alsa`.
+    pub host: String,
+    /// Input device name or ID from `wayland-wispr devices`; default device if unset.
+    pub device: Option<String>,
+    /// Recordings shorter than this are rejected.
+    pub min_seconds: f32,
+    /// Recordings whose loudest 30 ms window is below this are rejected as silent.
+    pub silence_threshold_dbfs: f32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            host: "auto".into(),
+            device: None,
+            min_seconds: 0.3,
+            silence_threshold_dbfs: -50.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct InjectionConfig {
     /// Chord sent after copying, e.g. `ctrl+v`, `ctrl+shift+v`, `shift+Insert`.
     pub paste_chord: String,
@@ -96,6 +121,10 @@ pub struct DebugConfig {
     pub fake_processing_ms: u64,
     /// Placeholder result text, e.g. to test Unicode/multiline insertion.
     pub fake_transcript: Option<String>,
+    /// If set, every normalized (16 kHz mono) recording is written here as a
+    /// private WAV. Relative paths are resolved against the config file's
+    /// directory. Off by default: recordings are otherwise never persisted.
+    pub save_recordings_dir: Option<PathBuf>,
 }
 
 impl Default for DebugConfig {
@@ -103,6 +132,7 @@ impl Default for DebugConfig {
         Self {
             fake_processing_ms: 1500,
             fake_transcript: None,
+            save_recordings_dir: None,
         }
     }
 }
@@ -128,11 +158,21 @@ impl Config {
             Err(source) => return Err(ConfigError::Read { path, source }),
         };
 
-        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let mut config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.clone(),
             source,
         })?;
         config.validate()?;
+        if let Some(dir) = &config.debug.save_recordings_dir
+            && dir.is_relative()
+        {
+            let base = path.parent().unwrap_or(Path::new("."));
+            let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
+            config.debug.save_recordings_dir = Some(base.join(dir));
+        }
+        if let Some(dir) = &config.debug.save_recordings_dir {
+            tracing::warn!(dir = %dir.display(), "debug: recordings will be saved to disk");
+        }
         tracing::info!(path = %path.display(), "loaded config");
         Ok(config)
     }
@@ -158,6 +198,21 @@ impl Config {
         if self.injection.pre_insert_delay_ms > 5000 || self.injection.key_delay_ms > 500 {
             return Err(ConfigError::Invalid(
                 "injection delays must be at most 5000 ms (pre-insert) and 500 ms (per key)".into(),
+            ));
+        }
+        if !self.audio.host.eq_ignore_ascii_case("auto")
+            && let Err(e) = self.audio.host.parse::<cpal::HostId>()
+        {
+            return Err(ConfigError::Invalid(format!("audio.host: {e}")));
+        }
+        if !(0.0..=10.0).contains(&self.audio.min_seconds) {
+            return Err(ConfigError::Invalid(
+                "audio.min_seconds must be between 0 and 10".into(),
+            ));
+        }
+        if !(-100.0..=0.0).contains(&self.audio.silence_threshold_dbfs) {
+            return Err(ConfigError::Invalid(
+                "audio.silence_threshold_dbfs must be between -100 and 0".into(),
             ));
         }
         if self.debug.fake_processing_ms > 60_000 {
@@ -237,6 +292,31 @@ mod tests {
             let c: Config = toml::from_str(text).unwrap();
             c.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn validates_audio_settings() {
+        for bad in [
+            "[audio]\nhost = \"coreaudio\"",
+            "[audio]\nsilence_threshold_dbfs = 3.0",
+            "[audio]\nmin_seconds = -1.0",
+        ] {
+            let c: Config = toml::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        for good in ["[audio]\nhost = \"pipewire\"", "[audio]\nhost = \"ALSA\""] {
+            let c: Config = toml::from_str(good).unwrap();
+            c.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn resolves_recordings_dir_relative_to_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[debug]\nsave_recordings_dir = \"rec\"").unwrap();
+        let c = Config::load(Some(&path)).unwrap();
+        assert_eq!(c.debug.save_recordings_dir, Some(dir.path().join("rec")));
     }
 
     #[test]

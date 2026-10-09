@@ -7,6 +7,12 @@ margin_bottom = 48  # logical pixels from the bottom edge
 [recording]
 max_seconds = 120   # recording stops automatically after this
 
+[audio]
+host = "auto"                  # PipeWire if available, else ALSA; or "pipewire" / "alsa"
+# device = "..."               # name or id from `wayland-wispr devices`
+min_seconds = 0.3              # shorter recordings are rejected
+silence_threshold_dbfs = -50.0 # quieter recordings are rejected as "no speech"
+
 [injection]
 paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
 pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert
@@ -14,4 +20,5 @@ key_delay_ms = 10
 
 [debug]
 fake_processing_ms = 1500  # placeholder processing delay until real backends exist
+# save_recordings_dir = "/path"  # debug only: save every recording as WAV
 # fake_transcript = "Grüße, 世界 👋\nsecond line"  # test text for copy/insert

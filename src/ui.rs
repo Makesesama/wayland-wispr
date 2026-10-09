@@ -10,7 +10,7 @@ use gtk4::{gdk, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::config::{Config, OverlayLayer};
-use crate::controller::State;
+use crate::controller::{SessionId, State};
 use crate::injection::Action;
 
 const APP_ID: &str = "de.makussu.WaylandWispr";
@@ -34,14 +34,31 @@ window.wispr {
 .ready .dot { color: #4dd28a; }
 .error .dot { color: #ff7a45; }
 .status { font-weight: bold; }
+levelbar.meter { min-width: 64px; }
+levelbar.meter block.filled { background-color: #ff4d4d; }
+levelbar.meter block.empty { background-color: rgba(255, 255, 255, 0.15); }
+levelbar.meter trough { min-height: 6px; }
 .detail { opacity: 0.75; }
 "#;
+
+/// Messages to the GTK thread. Owned and `Send`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiEvent {
+    State(View),
+    /// Microphone input level; ignored unless that session is recording.
+    Level {
+        session: SessionId,
+        dbfs: f32,
+    },
+}
 
 /// What the overlay should display. Owned and `Send`, built off the GTK thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
     Hidden,
-    Recording,
+    Recording {
+        session: SessionId,
+    },
     Processing,
     Ready {
         preview: String,
@@ -59,7 +76,7 @@ impl From<&State> for View {
     fn from(state: &State) -> Self {
         match state {
             State::Idle => View::Hidden,
-            State::Recording { .. } => View::Recording,
+            State::Recording { session } => View::Recording { session: *session },
             State::Processing { .. } => View::Processing,
             State::Ready { text, notice, .. } => View::Ready {
                 preview: preview(text),
@@ -88,7 +105,9 @@ struct Overlay {
     pill: gtk4::Box,
     status: gtk4::Label,
     detail: gtk4::Label,
+    meter: gtk4::LevelBar,
     recording_since: Cell<Option<Instant>>,
+    recording_session: Cell<Option<SessionId>>,
 }
 
 impl Overlay {
@@ -125,8 +144,16 @@ impl Overlay {
         detail.add_css_class("detail");
         detail.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         detail.set_max_width_chars(PREVIEW_CHARS as i32);
+        let meter = gtk4::LevelBar::for_interval(0.0, 1.0);
+        meter.add_css_class("meter");
+        meter.set_valign(gtk4::Align::Center);
+        // Drop the default low/high/full colour offsets; one colour is enough.
+        for name in ["low", "high", "full"] {
+            meter.remove_offset_value(Some(name));
+        }
         pill.append(&dot);
         pill.append(&status);
+        pill.append(&meter);
         pill.append(&detail);
         window.set_child(Some(&pill));
 
@@ -135,7 +162,9 @@ impl Overlay {
             pill,
             status,
             detail,
+            meter,
             recording_since: Cell::new(None),
+            recording_session: Cell::new(None),
         }
     }
 
@@ -144,14 +173,19 @@ impl Overlay {
             self.pill.remove_css_class(class);
         }
         self.recording_since.set(None);
+        self.recording_session.set(None);
+        self.meter.set_value(0.0);
+        self.meter
+            .set_visible(matches!(view, View::Recording { .. }));
 
         let (class, status, detail) = match view {
             View::Hidden => {
                 self.window.set_visible(false);
                 return;
             }
-            View::Recording => {
+            View::Recording { session } => {
                 self.recording_since.set(Some(Instant::now()));
+                self.recording_session.set(Some(*session));
                 ("recording", "Recording", "0:00".to_owned())
             }
             View::Processing => ("processing", "Transcribing…", String::new()),
@@ -175,6 +209,21 @@ impl Overlay {
         self.window.set_visible(true);
     }
 
+    fn level(&self, session: SessionId, dbfs: f32) {
+        if self.recording_session.get() != Some(session) {
+            return;
+        }
+        // Map -60..0 dBFS onto the bar, with a quick attack and slow decay.
+        let target = f64::from((dbfs + 60.0) / 60.0).clamp(0.0, 1.0);
+        let current = self.meter.value();
+        let next = if target > current {
+            target
+        } else {
+            (current - 0.05).max(target)
+        };
+        self.meter.set_value(next);
+    }
+
     fn tick(&self) {
         if let Some(since) = self.recording_since.get() {
             let secs = since.elapsed().as_secs();
@@ -186,7 +235,7 @@ impl Overlay {
 
 /// Run the GTK main loop until the app quits. Returns `false` if the overlay
 /// could not be shown (e.g. no layer-shell support).
-pub fn run(config: Config, views: async_channel::Receiver<View>) -> bool {
+pub fn run(config: Config, events: async_channel::Receiver<UiEvent>) -> bool {
     let app = gtk4::Application::builder()
         .application_id(APP_ID)
         // Single-instance handling is done by the control socket, not D-Bus.
@@ -195,13 +244,13 @@ pub fn run(config: Config, views: async_channel::Receiver<View>) -> bool {
 
     let failed = Rc::new(Cell::new(false));
     let hold = Rc::new(RefCell::new(None));
-    let views = Rc::new(RefCell::new(Some(views)));
+    let events = Rc::new(RefCell::new(Some(events)));
 
     app.connect_activate({
         let failed = failed.clone();
         move |app| {
             // Activation can be requested more than once; set up exactly once.
-            let Some(views) = views.borrow_mut().take() else {
+            let Some(events) = events.borrow_mut().take() else {
                 return;
             };
 
@@ -231,8 +280,11 @@ pub fn run(config: Config, views: async_channel::Receiver<View>) -> bool {
             glib::spawn_future_local({
                 let app = app.clone();
                 async move {
-                    while let Ok(view) = views.recv().await {
-                        overlay.apply(&view);
+                    while let Ok(event) = events.recv().await {
+                        match event {
+                            UiEvent::State(view) => overlay.apply(&view),
+                            UiEvent::Level { session, dbfs } => overlay.level(session, dbfs),
+                        }
                     }
                     tracing::debug!("controller channel closed; quitting");
                     app.quit();

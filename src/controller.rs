@@ -33,6 +33,11 @@ pub enum Internal {
     RecordingLimitReached {
         session: SessionId,
     },
+    /// The microphone failed while recording.
+    CaptureFailed {
+        session: SessionId,
+        message: String,
+    },
     InjectionFinished {
         session: SessionId,
         result: Result<(), String>,
@@ -68,9 +73,13 @@ pub enum State {
 /// Side effects the runtime must perform after a transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
+    /// Open the microphone and start recording for a session.
+    StartCapture { session: SessionId },
+    /// Stop recording and throw the audio away.
+    DiscardCapture { session: SessionId },
     /// Arm the maximum-duration timer for a recording session.
     ScheduleRecordingLimit { session: SessionId },
-    /// Begin processing the captured audio of a session.
+    /// Stop recording and process the captured audio of a session.
     StartProcessing { session: SessionId },
     /// Copy or insert a ready result. Must be followed by exactly one
     /// [`Internal::InjectionFinished`]; it is never retried automatically.
@@ -204,7 +213,11 @@ impl Controller {
             }
 
             (Command::Cancel, State::Idle) => Ok(Some("nothing to cancel")),
-            (Command::Cancel, _) => {
+            (Command::Cancel, state) => {
+                if let State::Recording { session } = state {
+                    out.effects
+                        .push(Effect::DiscardCapture { session: *session });
+                }
                 self.set(State::Idle, &mut out);
                 Ok(Some("cancelled"))
             }
@@ -269,6 +282,19 @@ impl Controller {
                 tracing::info!(session, "maximum recording duration reached");
                 self.stop_recording(&mut out);
             }
+            Internal::CaptureFailed { session, message } => {
+                if self.state != (State::Recording { session }) {
+                    return out;
+                }
+                out.effects.push(Effect::DiscardCapture { session });
+                self.set(
+                    State::Error {
+                        session: Some(session),
+                        message,
+                    },
+                    &mut out,
+                );
+            }
             Internal::InjectionFinished { session, result } => {
                 let State::Inserting {
                     session: current,
@@ -322,6 +348,7 @@ impl Controller {
         self.last_session += 1;
         let session = self.last_session;
         self.set(State::Recording { session }, out);
+        out.effects.push(Effect::StartCapture { session });
         out.effects.push(Effect::ScheduleRecordingLimit { session });
     }
 
@@ -375,7 +402,10 @@ mod tests {
         assert_eq!(kind(&c), StateKind::Recording);
         assert_eq!(
             o.effects,
-            vec![Effect::ScheduleRecordingLimit { session: 1 }]
+            vec![
+                Effect::StartCapture { session: 1 },
+                Effect::ScheduleRecordingLimit { session: 1 }
+            ]
         );
 
         let (r, o) = run(&mut c, Command::Toggle);
@@ -448,6 +478,42 @@ mod tests {
         let o = c.handle_internal(Internal::RecordingLimitReached { session: 1 });
         assert!(!o.changed);
         assert_eq!(kind(&c), StateKind::Recording);
+    }
+
+    #[test]
+    fn cancel_while_recording_discards_capture() {
+        let mut c = Controller::new();
+        run(&mut c, Command::Start);
+        let (r, o) = run(&mut c, Command::Cancel);
+        assert!(r.ok);
+        assert_eq!(o.effects, vec![Effect::DiscardCapture { session: 1 }]);
+
+        // Cancelling while processing has no capture left to discard.
+        run(&mut c, Command::Start);
+        run(&mut c, Command::Stop);
+        let (_, o) = run(&mut c, Command::Cancel);
+        assert!(o.effects.is_empty());
+    }
+
+    #[test]
+    fn capture_failure_is_an_error_only_for_current_recording() {
+        let mut c = Controller::new();
+        run(&mut c, Command::Start);
+        let o = c.handle_internal(Internal::CaptureFailed {
+            session: 1,
+            message: "mic unplugged".into(),
+        });
+        assert_eq!(o.effects, vec![Effect::DiscardCapture { session: 1 }]);
+        assert_eq!(c.status().error.as_deref(), Some("mic unplugged"));
+
+        run(&mut c, Command::Start); // session 2
+        run(&mut c, Command::Stop);
+        let o = c.handle_internal(Internal::CaptureFailed {
+            session: 2,
+            message: "late".into(),
+        });
+        assert!(!o.changed, "processing reports capture errors itself");
+        assert_eq!(kind(&c), StateKind::Processing);
     }
 
     #[test]

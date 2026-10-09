@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 
+use crate::audio::{self, Capture, CaptureEvent};
 use crate::config::Config;
-use crate::controller::{Command, Controller, Effect, Internal, Reply};
+use crate::controller::{Command, Controller, Effect, Internal, Reply, SessionId};
 use crate::injection::Injector;
-use crate::ui::View;
+use crate::ui::{UiEvent, View};
 use crate::{ipc, probe, ui};
 
 /// Covers copy/insert, which reply only after the paste chord was sent.
@@ -29,14 +30,19 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(socket = %socket.display(), "control socket ready");
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
-    let (view_tx, view_rx) = async_channel::unbounded::<View>();
+    let (ui_tx, ui_rx) = async_channel::unbounded::<UiEvent>();
 
     thread::Builder::new()
         .name("controller".into())
         .spawn({
-            let msg_tx = msg_tx.clone();
-            let config = config.clone();
-            move || controller_loop(msg_rx, msg_tx, view_tx, config, injector)
+            let runtime = Runtime {
+                tx: msg_tx.clone(),
+                ui: ui_tx,
+                config: Arc::new(config.clone()),
+                injector,
+                capture: None,
+            };
+            move || runtime.run(msg_rx)
         })
         .context("spawning controller thread")?;
 
@@ -51,7 +57,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         })
         .context("spawning IPC thread")?;
 
-    let shown = ui::run(config, view_rx);
+    let shown = ui::run(config, ui_rx);
 
     // Remove only the socket this process created. Worker threads are
     // detached and end with the process; they hold no persistent resources.
@@ -85,49 +91,169 @@ fn check_capabilities() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn controller_loop(
-    rx: mpsc::Receiver<Msg>,
+/// Owns everything the controller's effects act on. Runs on the
+/// controller thread; blocking work goes to worker threads.
+struct Runtime {
     tx: mpsc::Sender<Msg>,
-    views: async_channel::Sender<View>,
-    config: Config,
+    ui: async_channel::Sender<UiEvent>,
+    config: Arc<Config>,
     injector: Arc<Injector>,
-) {
-    let mut controller = Controller::new();
-    // Reply channel of the one copy/insert command awaiting completion. The
-    // controller rejects further copy/insert commands until it completes.
-    let mut pending: Option<mpsc::SyncSender<Reply>> = None;
+    /// The microphone capture of the current recording session, if any.
+    capture: Option<(SessionId, Capture)>,
+}
 
-    for msg in rx {
-        let outcome = match msg {
-            Msg::Command(cmd, reply_tx) => {
-                let (reply, outcome) = controller.handle_command(cmd);
-                match reply {
-                    Some(reply) => {
-                        log_reply(&format!("{cmd:?}"), &reply);
-                        let _ = reply_tx.send(reply);
+impl Runtime {
+    fn run(mut self, rx: mpsc::Receiver<Msg>) {
+        let mut controller = Controller::new();
+        // Reply channel of the one copy/insert command awaiting completion.
+        // The controller rejects further copy/insert commands until then.
+        let mut pending: Option<mpsc::SyncSender<Reply>> = None;
+
+        for msg in rx {
+            let outcome = match msg {
+                Msg::Command(cmd, reply_tx) => {
+                    let (reply, outcome) = controller.handle_command(cmd);
+                    match reply {
+                        Some(reply) => {
+                            log_reply(&format!("{cmd:?}"), &reply);
+                            let _ = reply_tx.send(reply);
+                        }
+                        None => pending = Some(reply_tx),
                     }
-                    None => pending = Some(reply_tx),
+                    outcome
                 }
-                outcome
+                Msg::Internal(event) => controller.handle_internal(event),
+            };
+
+            if let Some(reply) = outcome.deferred_reply.as_ref() {
+                log_reply("deferred", reply);
+                if let Some(reply_tx) = pending.take() {
+                    let _ = reply_tx.send(reply.clone());
+                }
             }
-            Msg::Internal(event) => controller.handle_internal(event),
-        };
 
-        if let Some(reply) = outcome.deferred_reply.as_ref() {
-            log_reply("deferred", reply);
-            if let Some(reply_tx) = pending.take() {
-                let _ = reply_tx.send(reply.clone());
+            if outcome.changed {
+                let view = View::from(controller.state());
+                if self.ui.send_blocking(UiEvent::State(view)).is_err() {
+                    break; // UI is gone.
+                }
             }
-        }
 
-        if outcome.changed && views.send_blocking(View::from(controller.state())).is_err() {
-            break; // UI is gone.
-        }
-
-        for effect in outcome.effects {
-            execute(effect, &tx, &config, &injector);
+            for effect in outcome.effects {
+                self.execute(effect);
+            }
         }
     }
+
+    fn execute(&mut self, effect: Effect) {
+        match effect {
+            Effect::StartCapture { session } => {
+                let tx = self.tx.clone();
+                let ui = self.ui.clone();
+                let capture = Capture::start(
+                    &self.config.audio,
+                    self.config.max_recording(),
+                    move |event| match event {
+                        CaptureEvent::Level(dbfs) => {
+                            let _ = ui.try_send(UiEvent::Level { session, dbfs });
+                        }
+                        CaptureEvent::Failed(message) => {
+                            let _ = tx
+                                .send(Msg::Internal(Internal::CaptureFailed { session, message }));
+                        }
+                    },
+                );
+                // Replacing an older capture cancels it.
+                self.capture = Some((session, capture));
+            }
+            Effect::DiscardCapture { session } => {
+                if self.capture.as_ref().is_some_and(|(s, _)| *s == session) {
+                    self.capture = None; // Drop cancels without blocking.
+                }
+            }
+            Effect::ScheduleRecordingLimit { session } => {
+                let delay = self.config.max_recording();
+                self.spawn("limit", move || {
+                    thread::sleep(delay);
+                    Internal::RecordingLimitReached { session }
+                });
+            }
+            Effect::StartProcessing { session } => {
+                let capture = match self.capture.take() {
+                    Some((s, capture)) if s == session => Some(capture),
+                    other => {
+                        self.capture = other;
+                        None
+                    }
+                };
+                let config = self.config.clone();
+                self.spawn("process", move || Internal::ProcessingFinished {
+                    session,
+                    result: process(session, capture, &config),
+                });
+            }
+            Effect::Inject {
+                session,
+                action,
+                text,
+            } => {
+                let injector = self.injector.clone();
+                self.spawn("inject", move || {
+                    let result = injector.run(action, &text);
+                    if let Err(e) = &result {
+                        tracing::warn!(session, ?action, error = %e, "injection failed");
+                    }
+                    Internal::InjectionFinished { session, result }
+                });
+            }
+        }
+    }
+
+    /// Run `work` on a worker thread and feed its event back to the
+    /// controller.
+    fn spawn<F>(&self, name: &str, work: F)
+    where
+        F: FnOnce() -> Internal + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        let spawned = thread::Builder::new().name(name.into()).spawn(move || {
+            let _ = tx.send(Msg::Internal(work()));
+        });
+        if let Err(e) = spawned {
+            // Without the worker the controller would wait forever; there is
+            // no sensible recovery from thread exhaustion here.
+            tracing::error!(error = %e, worker = name, "failed to spawn worker");
+        }
+    }
+}
+
+/// Stop the capture, normalize the audio, and (for now) return a placeholder
+/// transcript. Blocking; runs on a worker thread.
+fn process(
+    session: SessionId,
+    capture: Option<Capture>,
+    config: &Config,
+) -> Result<String, String> {
+    let capture = capture.ok_or("no recording for this session")?;
+    let raw = capture.finish()?;
+
+    let clip = audio::prepare(&raw, &config.audio, |clip| {
+        if let Some(dir) = &config.debug.save_recordings_dir {
+            match audio::save_debug_wav(dir, session, clip) {
+                Ok(path) => tracing::info!(path = %path.display(), "saved debug recording"),
+                Err(e) => tracing::warn!(error = %e, "could not save debug recording"),
+            }
+        }
+    })?;
+
+    // Transcription backends arrive in Phase 4/7.
+    thread::sleep(config.fake_processing());
+    Ok(config.debug.fake_transcript.clone().unwrap_or_else(|| {
+        format!(
+            "Placeholder transcript: recorded {:.1} s of audio; transcription is not implemented yet.",
+            clip.duration_secs()
+        )
+    }))
 }
 
 fn log_reply(command: &str, reply: &Reply) {
@@ -140,62 +266,4 @@ fn log_reply(command: &str, reply: &Reply) {
         message = reply.message.as_deref().unwrap_or(""),
         "command handled"
     );
-}
-
-/// Effect execution on worker threads. Audio capture and transcription are
-/// not implemented yet; processing produces a fixed text after a delay.
-fn execute(effect: Effect, tx: &mpsc::Sender<Msg>, config: &Config, injector: &Arc<Injector>) {
-    let (delay, event) = match effect {
-        Effect::Inject {
-            session,
-            action,
-            text,
-        } => {
-            let worker_tx = tx.clone();
-            let injector = injector.clone();
-            let spawned = thread::Builder::new().name("inject".into()).spawn(move || {
-                let result = injector.run(action, &text);
-                if let Err(e) = &result {
-                    tracing::warn!(session, ?action, error = %e, "injection failed");
-                }
-                let _ = worker_tx.send(Msg::Internal(Internal::InjectionFinished {
-                    session,
-                    result,
-                }));
-            });
-            if let Err(e) = spawned {
-                tracing::error!(error = %e, "failed to spawn injection worker");
-                let _ = tx.send(Msg::Internal(Internal::InjectionFinished {
-                    session,
-                    result: Err("could not start injection worker".into()),
-                }));
-            }
-            return;
-        }
-        Effect::ScheduleRecordingLimit { session } => (
-            config.max_recording(),
-            Internal::RecordingLimitReached { session },
-        ),
-        Effect::StartProcessing { session } => (
-            config.fake_processing(),
-            Internal::ProcessingFinished {
-                session,
-                result: Ok(config.debug.fake_transcript.clone().unwrap_or_else(|| {
-                    format!(
-                        "Placeholder transcript for session {session}; \
-                         audio capture and transcription are not implemented yet."
-                    )
-                })),
-            },
-        ),
-    };
-
-    let tx = tx.clone();
-    let spawned = thread::Builder::new().name("effect".into()).spawn(move || {
-        thread::sleep(delay);
-        let _ = tx.send(Msg::Internal(event));
-    });
-    if let Err(e) = spawned {
-        tracing::error!(error = %e, "failed to spawn effect worker");
-    }
 }

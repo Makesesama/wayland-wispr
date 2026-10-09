@@ -4,11 +4,12 @@ A planned Wayland dictation overlay: record speech, transcribe locally or throug
 an OpenAI-compatible API, optionally polish with an LLM, then insert the result
 into the active application.
 
-**Status:** early skeleton. The resident process, layer-shell overlay, control
-socket, session state machine, Wayland capability probe, and native
-clipboard/paste insertion work. Audio capture, transcription, and cleanup are
-**not implemented yet** — stopping a recording produces a placeholder transcript
-(configurable via `debug.fake_transcript`). No Nix app package yet.
+**Status:** early but usable end to end except transcription. The resident
+process, layer-shell overlay, control socket, session state machine, Wayland
+capability probe, microphone capture (native PipeWire, ALSA fallback), and native
+clipboard/paste insertion work. Transcription and cleanup are **not implemented
+yet** — a recording produces a placeholder transcript stating its duration
+(or `debug.fake_transcript`). No Nix app package yet.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
 Wayland constraints, and phased implementation checklist with acceptance criteria.
@@ -26,6 +27,7 @@ wayland-wispr toggle          # start recording / stop and process
 wayland-wispr start | stop    # push-to-talk press / release
 wayland-wispr cancel          # discard recording, processing, or ready result
 wayland-wispr status          # JSON state (never contains transcript text)
+wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
 wayland-wispr insert          # copy, then send the paste chord to the focused app
 ```
@@ -43,6 +45,7 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/ipc.rs` | Versioned, size-bounded JSON-line Unix socket protocol |
 | `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0) |
 | `src/probe.rs` | Native `wayland-client` global probe on its own connection |
+| `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
 | `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` paste chord (`wayland-protocols-misc`) |
 | `src/config.rs` | TOML settings with validation |
 
@@ -67,8 +70,9 @@ The flake pins nixpkgs in `flake.lock` and provides development shells for
 
 - Rust, Cargo, rustfmt, Clippy, rust-analyzer, and Rust library sources.
 - GTK4 and gtk4-layer-shell for a Wayland overlay, plus GTK schemas and icons.
-- ALSA headers for CPAL microphone capture; PipeWire/PulseAudio routing comes
-  from the host's audio setup.
+- PipeWire and ALSA libraries for CPAL microphone capture. `audio.host = "auto"`
+  uses the native PipeWire host when its socket is reachable and logs why it
+  fell back to ALSA otherwise.
 - CMake, Ninja, Clang, and libclang for CPU-only `whisper-rs` builds and bindgen.
 - OpenSSL for HTTP clients using native TLS; `reqwest` with rustls is also an option.
 - Wayland/xkbcommon libraries and `wayland-info` for protocol inspection.
@@ -95,8 +99,13 @@ cargo run -q -- copy
 cargo run -q -- cancel
 ```
 
-The dev config uses `debug.fake_transcript` (Unicode, emoji, newline, tab) as the
-result text, so clipboard/paste behavior can be tested before audio exists.
+The dev config saves every normalized recording (16 kHz mono WAV, private
+permissions) to `dev/recordings/` (gitignored) so you can listen to what a model
+would receive, e.g. `pw-play dev/recordings/<file>.wav`. Recordings shorter than
+`audio.min_seconds` or quieter than `audio.silence_threshold_dbfs` end in an
+error instead of a result. Uncomment `debug.fake_transcript` to paste fixed test
+text (Unicode, emoji, newline, tab) instead of the duration placeholder.
+Outside the dev config, recordings are never written to disk.
 Config changes require restarting `run`; client commands don't read the config.
 
 Check the environment:

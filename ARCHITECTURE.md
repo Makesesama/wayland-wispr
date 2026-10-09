@@ -2,8 +2,8 @@
 
 ## Status and goal
 
-**Status:** Phase 1 skeleton plus Phase 2 controller/IPC exist (see checklist).
-Audio, transcription, cleanup, and insertion modules below are still planned.
+**Status:** Phases 1–3 (overlay, controller/IPC, insertion, microphone capture)
+are implemented; see the checklist. Transcription and cleanup are still planned.
 
 See [RESEARCH.md](RESEARCH.md) for native-library research, source links, and
 remaining uncertainties. Runtime subprocess helpers and X11/uinput compatibility
@@ -28,9 +28,9 @@ compatible. Keep transcription, cleanup, and insertion independently configurabl
 | Language | Rust | Native audio/Wayland integration, concurrency, strong types. |
 | GUI | `gtk4` + `gtk4-layer-shell` | Mature widgets and a straightforward overlay. Requires the native GTK4/layer-shell libraries already in the dev shell. |
 | GUI alternative | `iced` + `iced_layershell` | Declarative Elm-style state updates; less GTK/GObject integration. Not the initial implementation. It still has native graphics/system dependencies. |
-| Audio | `cpal` | Capture microphone PCM off the UI thread. ALSA is the initial Linux backend; evaluate native PipeWire support if routing/device behavior needs it. |
+| Audio | `cpal` 0.18 (`pipewire` feature) + `rtrb` | Native PipeWire host by default, ALSA fallback. The stream lives on a capture thread; the realtime callback only pushes f32 samples into a lock-free SPSC ring. |
 | WAV encoding | `hound` | Simple PCM WAV encoding for API uploads and debugging fixtures. |
-| Resampling | Evaluate `rubato` | Convert device audio to the model's required format; do not assume the microphone runs at 16 kHz. |
+| Resampling | `rubato` 5 (`Fft`, fixed ratio) | Whole-clip conversion of device-rate mono audio to 16 kHz after stop; startup delay trimmed by `process_all`. |
 | HTTP / async | Prefer `reqwest` with rustls + `tokio`; validate in a transport spike | Full control of two simple operations. `async-openai` is the researched typed SDK alternative covering both STT and chat; configure its auth/retries/transport deliberately. |
 | Local transcription | Optional `whisper-rs` | Native whisper.cpp integration; CPU by default, optional Vulkan after benchmarking. Quantized models supplied separately. See RESEARCH.md for RAM/VRAM constraints. |
 | Cleanup | OpenAI-compatible chat completions | Supports remote providers and local servers exposing the same API. Native in-process LLM inference is deferred. |
@@ -370,10 +370,17 @@ work cannot change the active session, and repeated commands do not crash it.
 
 ### Phase 3 — Microphone capture
 
-- [ ] Enumerate/select microphone; record through CPAL with bounded buffering.
-- [ ] Convert sample formats/channels; add resampling and WAV encoding.
-- [ ] Show elapsed time and basic volume activity; enforce duration/silence limits.
-- [ ] Handle missing/disconnected/busy devices and release capture after stop/cancel.
+- [x] Enumerate/select microphone (`devices`, `audio.device`); record through CPAL
+      with a lock-free ring and a mono buffer capped at `max_seconds` + 1 s.
+- [x] Convert all integer/float sample formats and channel counts; resample to
+      16 kHz mono; encode 16-bit WAV in memory.
+- [x] Show elapsed time and a level meter; enforce duration (timer + buffer cap),
+      minimum length, and silence threshold before processing.
+- [x] Missing/disconnected/busy devices and stream errors end in a visible Error
+      state; stop/cancel release the device.
+- [x] Verified with a headless PipeWire virtual mic: 2 s tone → 2.05 s 16 kHz WAV
+      at the expected level; silent input → "no speech detected".
+- [ ] Manual test with a real microphone on the target desktop.
 
 **Acceptance:** an explicitly requested private test WAV plays correctly;
 conversion tests cover sample formats/channel counts, and capture never blocks

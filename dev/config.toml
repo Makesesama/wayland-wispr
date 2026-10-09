@@ -1,0 +1,30 @@
+# Development config, used automatically inside `nix develop` / direnv in this
+# repo (via WAYLAND_WISPR_CONFIG). Edit freely and restart `cargo run -- run`.
+# Never put secrets here; API keys will be read from environment variables.
+
+[overlay]
+layer = "overlay"
+margin_bottom = 48
+
+[recording]
+max_seconds = 120
+
+[audio]
+host = "auto"                   # PipeWire if available, else ALSA; or "pipewire" / "alsa"
+# device = "..."                # see `cargo run -- devices`; default input if unset
+min_seconds = 0.3
+silence_threshold_dbfs = -50.0
+
+[injection]
+paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
+pre_insert_delay_ms = 150
+key_delay_ms = 10
+
+[debug]
+fake_processing_ms = 500
+# Normalized 16 kHz mono WAVs of every recording go to dev/recordings/
+# (gitignored, private permissions). Listen with e.g. `pw-play <file>`.
+save_recordings_dir = "recordings"
+# Uncomment to paste fixed test text instead of the placeholder that reports
+# the recorded duration (exercises Unicode, emoji, multiline, tab insertion).
+# fake_transcript = "Grüße aus wayland-wispr, 世界 👋\nzweite Zeile\tmit Tab"

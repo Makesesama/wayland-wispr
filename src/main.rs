@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod config;
 mod controller;
 mod injection;
@@ -46,6 +47,12 @@ enum Cmd {
     Copy,
     /// Copy the ready result and send the paste chord to the focused application.
     Insert,
+    /// List microphones (input devices) of the configured audio host.
+    Devices {
+        /// Print JSON instead of a list.
+        #[arg(long)]
+        json: bool,
+    },
     /// Report native Wayland protocol support of the current compositor.
     Probe {
         /// Print JSON instead of a table.
@@ -80,6 +87,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Probe { json } => return probe(json),
+        Cmd::Devices { json } => {
+            let config = Config::load(cli.config.as_deref())?;
+            return devices(&config, json);
+        }
         Cmd::Toggle => Command::Toggle,
         Cmd::Start => Command::Start,
         Cmd::Stop => Command::Stop,
@@ -104,6 +115,34 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+fn devices(config: &Config, json: bool) -> anyhow::Result<ExitCode> {
+    let (host, devices) =
+        audio::capture::list_devices(&config.audio).map_err(anyhow::Error::msg)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "host": host, "devices": devices }))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("audio host: {host}");
+    if devices.is_empty() {
+        println!("  (no input devices)");
+    }
+    for d in &devices {
+        println!("{} {}", if d.default { "*" } else { " " }, d.name);
+        if let Some(id) = &d.id {
+            println!("    id:     {id}");
+        }
+        if let Some(cfg) = &d.config {
+            println!("    format: {cfg}");
+        }
+    }
+    println!();
+    println!("* = default. Select with `[audio] device = \"<name or id>\"`.");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn probe(json: bool) -> anyhow::Result<ExitCode> {
