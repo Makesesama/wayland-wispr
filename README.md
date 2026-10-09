@@ -1,431 +1,546 @@
 # wayland-wispr
 
-A planned Wayland dictation overlay: record speech, transcribe locally or through
-an OpenAI-compatible API, optionally polish with an LLM, then insert the result
-into the active application.
+<p align="center">
+  <img src=".assets/overlay.png" alt="wayland-wispr recording overlay: a small pill with a red dot, a live waveform and the elapsed time">
+</p>
 
-**Status:** usable end to end with local transcription. The resident
-process, layer-shell overlay, control socket, session state machine, Wayland
-capability probe, microphone capture (native PipeWire, ALSA fallback), local
-whisper.cpp transcription (CPU or Vulkan GPU), LLM cleanup through a
-user-run OpenAI-compatible server (e.g. Ollama), and native clipboard/paste
-insertion work. The remote transcription API backend is **not implemented
-yet**. Nix package and home-manager service: see [Nix](#nix).
+**Wayland-native, local-first dictation.** Press a key, speak, press it again,
+and the text appears in the focused window.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
-Wayland constraints, and phased implementation checklist with acceptance criteria.
-[RESEARCH.md](RESEARCH.md) compares native HTTP/SDK, local Whisper/VRAM, and
-clipboard/virtual-keyboard options with source links.
+wayland-wispr is a small resident process with a status overlay. You control it
+from a keybinding in your compositor or window manager:
 
-## Usage
+1. **Record.** It captures your microphone through PipeWire, or ALSA as a
+   fallback. A pill shows a live waveform and the elapsed time.
+2. **Transcribe.** whisper.cpp transcribes the recording **on your machine**,
+   on the CPU or on the GPU through Vulkan. It recognises German and English,
+   or any language Whisper supports.
+3. **Polish (optional).** An LLM server that you run yourself (Ollama,
+   llama-server, …) removes filler words and stutters. It also applies
+   self-corrections ("at two, actually three" becomes "at three"), fixes
+   punctuation and turns spoken "new line" or "Komma" into formatting. If
+   the server fails, the raw transcript is used.
+4. **Insert.** The result goes to the clipboard and is typed into the focused
+   application through a virtual keyboard. Typing works with any keyboard
+   layout and doesn't depend on the application's paste shortcut.
 
-```sh
-cargo run -- probe            # which native protocols the compositor offers
-cargo run -- run              # resident process + overlay (needs wlr layer-shell)
+Recordings are never written to disk, and no network requests are made unless
+you point cleanup at a remote server. `status` never includes transcript text.
 
-# from another terminal / a WM keybinding:
-wayland-wispr toggle          # start recording / stop, process, copy + type into focused field
-wayland-wispr start | stop    # push-to-talk press / release
-wayland-wispr cancel          # discard recording, processing, or ready result (alias: abort)
-wayland-wispr status          # JSON state (never contains transcript text)
-wayland-wispr devices         # list microphones of the audio host
-wayland-wispr copy            # put the ready result on the clipboard
-wayland-wispr insert          # copy, then type (or paste) into the focused app
-wayland-wispr insert --raw    # same with the raw transcript (also `copy --raw`)
-wayland-wispr check-config    # validate the config, show which model and theme files it uses
-wayland-wispr default-theme   # print the built-in overlay CSS (template for overlay.theme)
-wayland-wispr bench <wav>     # measure the configured whisper model on this machine
-wayland-wispr cleanup "text"  # run LLM cleanup on a text (or stdin)
-wayland-wispr cleanup-eval dev/cleanup-fixtures.toml  # compare models/prompts
-```
+> **Status:** usable end to end with local transcription and local LLM cleanup.
+> A remote speech-to-text API backend is not implemented yet.
 
-The control socket is `$XDG_RUNTIME_DIR/wayland-wispr/control.sock` (private
-directory, same-UID peers only). Logging uses `RUST_LOG` (default `info`).
-Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
-[config.example.toml](config.example.toml).
+> **AI notice:** this project was created with AI assistance (Claude Opus 5.5).
 
-| Module | Purpose |
+## Contents
+
+- [Requirements](#requirements)
+- [Setup with Nix](#setup-with-nix)
+- [Guide](#guide)
+- [Configuration](#configuration)
+- [Command reference](#command-reference)
+- [Development](#development)
+
+## Requirements
+
+- A Wayland compositor that provides these protocols. wlroots-based compositors
+  such as river, sway and Hyprland do. **GNOME/Mutter does not.**
+  - `zwlr_layer_shell_v1` for the overlay
+  - `zwp_virtual_keyboard_manager_v1` for typing and paste chords
+  - `ext_data_control_manager_v1` or `zwlr_data_control_manager_v1` for the
+    clipboard
+
+  To check your compositor, run `wayland-wispr probe` (or
+  `wayland-info | grep -E 'layer_shell|virtual_keyboard|data_control'`).
+- PipeWire or ALSA for microphone input.
+- For GPU transcription: a Vulkan driver, e.g. `hardware.graphics.enable = true`
+  on NixOS. A discrete GPU runs `large-v3-turbo` in about 0.3 s per clip.
+  Small models run fine on the CPU.
+- For cleanup (optional): an OpenAI-compatible `/chat/completions` server.
+  Ollama is the default.
+
+## Setup with Nix
+
+The flake supports `x86_64-linux` and `aarch64-linux`. It provides:
+
+| Output | Contents |
 | --- | --- |
-| `src/main.rs` | CLI (`clap`) |
-| `src/app.rs` | Resident process: controller thread, IPC thread, effect workers |
-| `src/controller.rs` | Pure session state machine with session IDs (unit-tested) |
-| `src/ipc.rs` | Versioned, size-bounded JSON-line Unix socket protocol |
-| `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0, click-through; configurable position/output; waveform + elapsed time while recording) |
-| `src/theme.rs` | Custom CSS themes over the built-in one; light/dark variants follow darkman's D-Bus API, else the portal `color-scheme` |
-| `src/probe.rs` | Native `wayland-client` global probe on its own connection |
-| `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
-| `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` direct typing and paste chord (`wayland-protocols-misc`) |
-| `src/transcription/` | Backend interface + cancellation; `whisper.rs`: whisper.cpp worker thread (lazy load, preload on record, idle unload, de/en-restricted language detection); `model.rs`: model resolution/validation |
-| `src/cleanup/` | LLM cleanup: blocking `ureq` client for streamed `/chat/completions` (cancellable, output-capped), built-in few-shot prompt (`prompt.toml`), reply sanitizing/guards with raw fallback, `cleanup`/`cleanup-eval` commands |
-| `src/bench.rs` | `bench` subcommand: load time, latency, RSS and VRAM per model/device |
-| `src/config.rs` | TOML settings with validation |
+| `packages.<system>.wayland-wispr` (`default`) | CPU build |
+| `packages.<system>.wayland-wispr-vulkan` | Build with Vulkan GPU support for whisper.cpp |
+| `homeManagerModules.wayland-wispr` (`default`) | User service, config file and models |
+| `overlays.default` | Adds `pkgs.wayland-wispr` |
+| `legacyPackages.<system>.whisperModels.<name>` | Pinned whisper.cpp ggml models |
+| `devShells.<system>.default` | Development shell |
 
-## Themes
-
-The overlay ships one built-in default theme. `overlay.theme` layers your own
-GTK CSS on top of it. That CSS is loaded at a higher priority than the built-in
-stylesheet, so it can override any rule. Print the built-in stylesheet with
-`wayland-wispr default-theme` to see the classes: `.pill`, `.dot`, the state
-classes `.recording`/`.processing`/`.ready`/`.error` on the pill, `.step`
-(`.pending`/`.active`/`.done`), `spinner.busy`, `.wave` (bar colour), `.status`,
-`.time`, `.detail`.
-
-```toml
-[overlay]
-theme = "theme.css"                    # one stylesheet, always used
-
-# or: light/dark variants, switched live
-[overlay.theme]
-light = "light.css"
-dark = "dark.css"                      # either may be omitted = default theme
-```
-
-Variants follow [darkman](https://darkman.whynothugo.nl/) over D-Bus
-(`nl.whynothugo.darkman`, `Mode` + `ModeChanged`). They pick up darkman
-starting or restarting at any time. While darkman is not running, they follow
-the XDG desktop portal's `org.freedesktop.appearance color-scheme`, and fall
-back to `dark` when neither gives a preference. Each switch re-reads the file,
-so edits show up at the next mode change.
-
-- A rule in your theme wins over **every** built-in rule for the same property
-  on the elements it matches, regardless of selector specificity. So a plain
-  `.dot { background-color: … }` also replaces the recording/processing
-  colours; restate the state rules, as [themes/light.css](themes/light.css)
-  (a complete light example) does.
-- A background colour in your theme replaces `overlay.opacity`; `overlay.scale`
-  only scales the built-in sizes.
-- The pill's width is measured once at startup with the variant active then
-  (the single theme, or `dark`). Variants should therefore change colours,
-  not sizes or fonts.
-- A shadow needs room inside the layer surface: give `window.wispr` padding
-  (as `themes/light.css` does). That padding adds to `overlay.margin` on
-  anchored edges.
-- A missing file or CSS error is logged (`overlay theme`); the default theme
-  stays in effect for anything not applied. `check-config` lists the files.
-
-## Local transcription (whisper)
-
-Models are whisper.cpp ggml files, looked up as
-`$XDG_DATA_HOME/wayland-wispr/models/ggml-<model>.bin` (or `models_dir` /
-`model_path`). The app never downloads anything; fetch models yourself:
+### Try it
 
 ```sh
-mkdir -p ~/.local/share/wayland-wispr/models && cd $_
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+flake=git+ssh://git@github.com/Makesesama/wayland-wispr.git
+nix run $flake -- probe     # does the compositor support everything?
+
+# the app never downloads models; fetch the default one with Nix (or curl)
+mkdir -p ~/.local/share/wayland-wispr/models
+ln -s "$(nix build --no-link --print-out-paths "$flake#whisperModels.\"base-q5_1\"")" \
+  ~/.local/share/wayland-wispr/models/ggml-base-q5_1.bin
+
+nix run $flake -- run       # terminal 1: overlay + resident process
+nix run $flake -- toggle    # terminal 2: start, speak, run again to stop
 ```
 
-Small vs. large is a per-machine config choice, not a different code path:
-
-| Machine | Suggested | Notes |
-| --- | --- | --- |
-| Discrete GPU (e.g. RX 9070 XT) | `large-v3-turbo-q5_0`, `device = "gpu"`, `beam_size = 5` | build with `--features whisper-vulkan`; ~0.3 s per clip, ~0.9 GiB VRAM |
-| CPU only / little VRAM | `small-q5_1` or `base-q5_1`, `device = "cpu"` | |
-
-Use multilingual models (not `.en`) for German. `languages = ["de", "en"]`
-restricts auto-detection; a *fixed* `language` that doesn't match the speech
-makes Whisper translate. `keep_loaded = "idle"` frees (V)RAM after
-`idle_unload_secs` (e.g. for a local LLM or games); `preload` loads the model
-while you are still speaking. GPU mode never silently falls back to CPU: a
-missing GPU or out-of-memory is an error suggesting a smaller model or CPU.
-
-Measure before choosing (prints the transcript to stdout):
-
-```sh
-cargo run --release --features whisper-vulkan -- bench dev/recordings/<file>.wav --device gpu
-cargo run --release -- bench dev/recordings/<file>.wav --model small-q5_1 --device cpu
-```
-
-`cancel` stops inference at the next whisper.cpp graph boundary; a running
-encoder pass (≈ one 30 s window) cannot be interrupted, so cancelling a long CPU
-transcription can take a moment.
-
-## LLM cleanup
-
-After transcription, the text goes to an OpenAI-compatible chat completions
-server that **you run yourself**. Cleanup removes fillers and stutters,
-resolves self-corrections ("at two, actually three" becomes "at three"), fixes
-punctuation, turns spoken "new line"/"neuer Absatz"/"Komma" into formatting,
-and writes enumerations as lists. It is on by default and points at Ollama:
-
-```sh
-ollama serve                      # or services.ollama on NixOS, see "Ollama for LLM cleanup"
-ollama pull qwen2.5:7b-instruct   # the default cleanup.model
-```
-
-If the server is not running, slow, or replies with something unusable, the
-**raw transcript is used**. The overlay then shows "Ready (not cleaned up)", and
-`status` reports `"cleanup": "failed"` with the reason. Before Ready, the overlay
-shows "Polishing…". When the cleaned text is wrong, `insert --raw` / `copy --raw`
-use the original transcript. Transcripts shorter than `min_words` skip the LLM.
-
-The model's reply is checked before it is used. The checks strip `<think>`
-blocks, quotes, labels, and code fences. They reject refusals, empty replies,
-replies much longer or shorter than the transcript, and replies made mostly of
-words that were never dictated (translations, answers, rewrites). Trailing
-Whisper hallucinations such as "Untertitel der Amara.org-Community" are removed
-before cleanup.
-
-Notes:
-
-- **Thinking models** (Qwen3.x, Qwen3.8) need `reasoning_effort = "none"`;
-  otherwise they spend the whole budget thinking and the raw text is used.
-- **Ollama unloads idle models after 5 minutes.** `preload = true` sends a tiny
-  request when recording starts, so the model loads while you speak (local
-  servers only, so a paid API is not billed for it). Setting
-  `OLLAMA_KEEP_ALIVE` on the server also works.
-- **Models that don't fit the GPU are split onto the CPU** by Ollama and become
-  slow rather than failing. Check `ollama ps` for `100% GPU`. With Whisper
-  large-v3-turbo loaded, a 16 GiB card fits a 7B model easily. Qwen3.8-27B fits
-  only at about 3 bits (`hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS`).
-- A non-local `base_url` must use https; transcripts are then sent to that
-  server. `api_key_env` names the environment variable holding a bearer token.
-- Tune the prompt by copying [src/cleanup/prompt.toml](src/cleanup/prompt.toml)
-  and setting `prompt_file`. Small models follow examples much better than
-  rules, so add an example rather than another "do not". Measure with
-  `cleanup-eval`; `--model`, `--base-url`, `--reasoning-effort`, and
-  `--prompt-file` override the config.
-
-**Insertion notes.** By default (`injection.on_ready = "insert"`) the result
-is copied to the clipboard and then typed into whatever is focused *when
-processing finishes* — no extra command. Typing goes through
-`zwp_virtual_keyboard_v1` with a short-lived keymap per text that maps each
-character to a printable key position, so it works the same in editors,
-browsers, and terminals and is independent of your layout and of app paste
-shortcuts. Line breaks are typed as Shift+Return (`injection.newline`); in a
-terminal that may still run a command, so prefer `"space"` if you dictate into
-shells. Emoji/supplementary characters may not type in Chromium-based apps; the
-clipboard always has the exact text. `method = "paste"` sends `paste_chord`
-instead (terminals: `"ctrl+shift+v"`). `on_ready = "none"` restores the
-explicit flow: the result stays ready for `copy`/`insert`.
-
-The clipboard is replaced (no restoration). Success means the keys were
-delivered to the compositor — Wayland gives no acknowledgement that the app
-inserted them. On failure the result stays ready for a manual `insert`/`copy`;
-nothing is retried automatically.
-
-## Nix
-
-Everything lives in [nix/](nix/); `flake.nix` only wires it up.
-
-| File | Purpose |
-| --- | --- |
-| `nix/default.nix` | Package (`callPackage`-style). `vulkanSupport = true` builds whisper.cpp with Vulkan; `ggmlCpuFlags` overrides the CPU SIMD level |
-| `nix/ggml-cpu.nix` | `GGML_*` flags shared by package and shell (x86-64-v3 on x86_64, because the Nix compiler wrapper strips `-march=native`) |
-| `nix/shell.nix` | Dev shell (`nix develop`, or `nix-shell nix/shell.nix`) |
-| `nix/service.nix` | home-manager module: systemd user service, config file, models |
-| `nix/models.nix`, `nix/models.json` | Pinned whisper.cpp ggml models from Hugging Face (fixed-output fetches) |
-| `nix/update-models.sh` | Regenerates `models.json` from the Hugging Face API (hashes from LFS metadata, no downloads) |
-
-Flake outputs: `packages.<system>.{wayland-wispr,wayland-wispr-vulkan,default}`,
-`overlays.default`, `homeManagerModules.{wayland-wispr,default}`,
-`legacyPackages.<system>.whisperModels.<name>`, `devShells`, `checks`.
+### 1. Add the flake input
 
 ```nix
-# flake inputs
-wayland-wispr.url = "git+ssh://git@git.makussu.de:2122/Makussu/wayland-wispr.git";
-wayland-wispr.inputs.nixpkgs.follows = "nixpkgs";
-
-# home-manager
-imports = [ inputs.wayland-wispr.homeManagerModules.default ];
-services.wayland-wispr = {
-  enable = true;
-  package = inputs.wayland-wispr.packages.${pkgs.stdenv.hostPlatform.system}.wayland-wispr-vulkan;
-  settings = {
-    transcription.whisper = {
-      model = "large-v3-turbo-q5_0"; # fetched and linked automatically
-      device = "gpu";
-      languages = [ "de" "en" ];
-      beam_size = 5;
-    };
-    cleanup.model = "qwen2.5:7b-instruct";
-  };
-  models = [ "large-v3-turbo-q5_0" "small-q5_1" ]; # optional: extra models for `bench`
+# flake.nix
+inputs.wayland-wispr = {
+  url = "git+ssh://git@github.com/Makesesama/wayland-wispr.git";
+  inputs.nixpkgs.follows = "nixpkgs";
 };
 ```
 
-- **Config:** `settings` becomes `~/.config/wayland-wispr/config.toml` and is
-  checked at build time with `wayland-wispr check-config`, so typos and invalid
-  values fail `home-manager switch` instead of the service. With empty
-  `settings`, no file is written.
-- **Themes:** Nix paths work directly and are copied to the store, e.g.
-  `settings.overlay.theme.light = ./wispr-light.css;`. The example themes are
-  installed with the package:
-  `"${config.services.wayland-wispr.package}/share/wayland-wispr/themes/light.css"`.
-  A changed file restarts the service.
-- **Models:** `models` (default: the configured `transcription.whisper.model`)
-  are fetched from the pinned whisper.cpp repo and linked into
-  `~/.local/share/wayland-wispr/models/`, the directory the app already uses.
-  Manually downloaded models there keep working. `extraModels` links your own
-  files by name. Setting `model_path`/`models_dir` bypasses the links (the
-  module warns).
-- **Service:** `wayland-wispr.service` runs `wayland-wispr run` with
-  `graphical-session.target`. Your session must import `WAYLAND_DISPLAY` into
-  the systemd user environment (e.g. `systemctl --user import-environment
-  WAYLAND_DISPLAY` from the river init). A config or model change restarts it.
-  Secrets for `cleanup.api_key_env` go in `environmentFile`, never `settings`.
-  The module does not run Ollama; use `services.ollama` on the system.
-- Bind `wayland-wispr toggle`, `insert`, and `cancel` (or its alias `abort`) in the WM. The package is
-  added to `home.packages`.
+### 2. Enable the home-manager module
 
-### Ollama for LLM cleanup
+```nix
+# home-manager configuration
+{ inputs, pkgs, ... }:
+{
+  imports = [ inputs.wayland-wispr.homeManagerModules.default ];
 
-Cleanup needs an OpenAI-compatible server, and the home-manager module does not
-start one. Use the NixOS `services.ollama` module. Unlike the home-manager
-module of the same name, it can pull models declaratively. It goes in the
-**system** configuration:
+  services.wayland-wispr = {
+    enable = true;
+
+    # Vulkan build for device = "gpu"; omit for the CPU-only package.
+    package = inputs.wayland-wispr.packages.${pkgs.stdenv.hostPlatform.system}.wayland-wispr-vulkan;
+
+    settings = {
+      transcription.whisper = {
+        model = "large-v3-turbo-q5_0"; # fetched and linked automatically
+        device = "gpu";
+        languages = [ "de" "en" ];
+        beam_size = 5;
+      };
+      cleanup.model = "qwen2.5:7b-instruct";
+    };
+  };
+}
+```
+
+On a CPU-only machine, use the default package and a small model, for example
+`model = "small-q5_1"` with `device = "cpu"`.
+
+The module does the following:
+
+- Installs the package into `home.packages`.
+- Writes `settings` to `~/.config/wayland-wispr/config.toml`. The file is
+  **validated at build time** with `wayland-wispr check-config`, so a typo
+  fails `home-manager switch` instead of the service. With empty `settings`
+  no file is written.
+- Fetches the configured whisper model (pinned hash) and links it into
+  `~/.local/share/wayland-wispr/models/`.
+- Runs `wayland-wispr run` as the systemd user service
+  `wayland-wispr.service`, started with `graphical-session.target`. A change
+  to the config, a theme or a model restarts the service.
+
+### 3. Export `WAYLAND_DISPLAY` to systemd
+
+The service only starts when `WAYLAND_DISPLAY` is set in the systemd user
+environment. Run this from your compositor's init, e.g. in the river init
+script, before `graphical-session.target` is reached:
+
+```sh
+systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+# or: dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+```
+
+### 4. Bind keys
+
+wayland-wispr does not grab global shortcuts. Bind its commands in your
+compositor or window manager:
+
+```sh
+# river: toggle mode
+riverctl map normal Super D      spawn 'wayland-wispr toggle'
+riverctl map normal Super+Shift D spawn 'wayland-wispr cancel'
+
+# river: push-to-talk instead (hold to record, release to process)
+riverctl map         normal Super D spawn 'wayland-wispr start'
+riverctl map -release normal Super D spawn 'wayland-wispr stop'
+```
+
+```ini
+# sway
+bindsym $mod+d exec wayland-wispr toggle
+bindsym $mod+Shift+d exec wayland-wispr cancel
+
+# Hyprland
+bind = SUPER, D, exec, wayland-wispr toggle
+bind = SUPER SHIFT, D, exec, wayland-wispr cancel
+```
+
+### 5. LLM cleanup with Ollama (optional)
+
+The home-manager module doesn't start an LLM server. Use the NixOS
+`services.ollama` module in the **system** configuration. It can pull models
+declaratively:
 
 ```nix
 # NixOS configuration
 services.ollama = {
   enable = true;
-  # GPU backend: ollama-vulkan (most GPUs), ollama-rocm (AMD), ollama-cuda
-  # (NVIDIA), ollama-cpu. The plain `ollama` package is CPU-only unless
+  # ollama-vulkan (most GPUs), ollama-rocm (AMD), ollama-cuda (NVIDIA) or
+  # ollama-cpu. The plain `ollama` package is CPU-only unless
   # nixpkgs.config.rocmSupport/cudaSupport is set.
   package = pkgs.ollama-vulkan;
-  # Pulled by ollama-model-loader.service after ollama starts; must match
-  # services.wayland-wispr.settings.cleanup.model.
-  loadModels = [ "qwen2.5:7b-instruct" ];
-  # host = "127.0.0.1"; port = 11434;  # defaults, matching cleanup.base_url
-  # environmentVariables.OLLAMA_KEEP_ALIVE = "30m";  # default unloads after 5 min
+  loadModels = [ "qwen2.5:7b-instruct" ]; # must match cleanup.model
+  # environmentVariables.OLLAMA_KEEP_ALIVE = "30m"; # default unloads after 5 min
 };
 hardware.graphics.enable = true; # Vulkan driver, also for wayland-wispr-vulkan
 ```
 
+The cleanup defaults (`http://127.0.0.1:11434/v1`, `qwen2.5:7b-instruct`)
+already point at this server.
+
+- The first rebuild pulls the model in the background. Follow the progress
+  with `journalctl -u ollama-model-loader`, then test the setup with
+  `wayland-wispr cleanup "ähm also das ist, äh, ein Test"`.
+- No service ordering is needed. Requests are made per dictation, and
+  `cleanup.preload` loads the model while you speak.
+- Keep Ollama on loopback. `host = "0.0.0.0"` exposes an unauthenticated API
+  to the network.
+- Without a usable GPU, choose a small model (e.g. `qwen2.5:3b-instruct`) or
+  set `cleanup.enabled = false`.
+
+### Without home-manager
+
+Install the package (or use `overlays.default`). Then put a config at
+`~/.config/wayland-wispr/config.toml` (see
+[config.example.toml](config.example.toml)) and a model in
+`~/.local/share/wayland-wispr/models/`. Start `wayland-wispr run` from your
+compositor's autostart.
+
+### Home-manager module options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enable` | `false` | Enable the service. |
+| `package` | this flake's `wayland-wispr` | Use `wayland-wispr-vulkan` for `device = "gpu"`. The module warns if they don't match. |
+| `settings` | `{ }` | The [configuration](#configuration) as a Nix attrset. Validated at build time. Nix paths (e.g. themes) are copied to the store. |
+| `models` | the configured `transcription.whisper.model` | Pinned whisper.cpp models to fetch and link into the models directory, e.g. extra ones for `bench`. Names from [nix/models.json](nix/models.json). |
+| `extraModels` | `{ }` | Your own ggml files by name: `{ "large-v3-de" = ./ggml-large-v3-de.bin; }` → `ggml-large-v3-de.bin`. |
+| `environmentFile` | `null` | Runtime `KEY=value` file for the service, e.g. the token named by `cleanup.api_key_env`. Not copied to the store. |
+| `systemdTarget` | `"graphical-session.target"` | Target the service is started with. |
+
+Available pinned models: `tiny`, `base`, `small`, `medium`, `large-v1`,
+`large-v2`, `large-v3`, `large-v3-turbo`, in quantised variants (`-q5_0`/`-q5_1`,
+`-q8_0`). For tiny through medium there are also English-only `.en`
+variants. `nix/update-models.sh` regenerates the list.
+
+Don't put secrets in `settings`, because it ends up in the world-readable Nix
+store. Use `environmentFile` instead.
+
+## Guide
+
+### Dictating
+
+| State | Overlay | What happens |
+| --- | --- | --- |
+| Recording | red dot, waveform, elapsed time | `toggle`/`stop` ends it. It stops by itself after `recording.max_seconds`. |
+| Processing | steps: transcribing → polishing | `cancel` aborts at any time. |
+| Ready | "Ready", or "Ready (not cleaned up)" | The text is copied and typed into the window that is focused **now**. |
+| Error | error message | E.g. "no speech" for recordings that are too short or too quiet. |
+
+Use `insert --raw` or `copy --raw` when the cleaned text is wrong: they use
+the original transcript. With `injection.on_ready = "none"` nothing happens
+automatically, and the result waits for an explicit `copy` or `insert`.
+That is useful when you want to choose the target window first.
+
+### Choosing a whisper model
+
+| Machine | Suggested settings | Notes |
+| --- | --- | --- |
+| Discrete GPU | `model = "large-v3-turbo-q5_0"`, `device = "gpu"`, `beam_size = 5` | Vulkan build; ~0.3 s per clip, ~0.9 GiB VRAM |
+| CPU only, or little VRAM | `model = "small-q5_1"` or `"base-q5_1"`, `device = "cpu"` | |
+
+- Use multilingual models (not `.en`) for anything other than English.
+- `languages = ["de", "en"]` limits auto-detection to these languages. A
+  fixed `language` that doesn't match the speech makes Whisper **translate**
+  into it.
+- `initial_prompt` gives Whisper hints about names and jargon you use often.
+- `keep_loaded = "idle"` frees (V)RAM after `idle_unload_secs`, e.g. for games
+  or a local LLM. `preload` loads the model while you are still speaking.
+- GPU mode never falls back to the CPU silently. A missing GPU or running out
+  of memory is reported as an error.
+
+Measure on your own hardware before choosing:
+
+```sh
+wayland-wispr bench recording.wav --device gpu
+wayland-wispr bench recording.wav --model small-q5_1 --device cpu
+```
+
+### LLM cleanup
+
+Cleanup sends the transcript to an OpenAI-compatible chat completions server
+that you run yourself. The model's reply is checked before it is used:
+
+- `<think>` blocks, quotes, labels and code fences are stripped.
+- Refusals, empty replies, and replies much longer or shorter than the
+  transcript are rejected.
+- Replies made mostly of words that were never dictated are rejected, e.g.
+  translations, answers or rewrites.
+
+If the server is down, too slow or fails these checks, the raw transcript is
+used. Whisper hallucinations at the end of a transcript, such as "Untertitel
+der Amara.org-Community", are removed beforehand.
+
+- **Thinking models** (Qwen3.x) need `reasoning_effort = "none"`. Otherwise
+  they spend the whole time budget thinking.
+- **VRAM:** Whisper and the LLM share the GPU. Run `ollama ps` and check that
+  it shows `100% GPU`. Models that don't fit are split onto the CPU and become
+  slow. With `large-v3-turbo` loaded, a 16 GiB card easily fits a 7B model.
+- **Remote providers:** set `base_url` (must use https) and `api_key_env`, and
+  provide the key through `environmentFile`. Transcripts are then sent to that
+  server.
+- **Prompt tuning:** copy [src/cleanup/prompt.toml](src/cleanup/prompt.toml)
+  and set `prompt_file`. Small models follow examples much better than rules.
+  Compare models and prompts with `wayland-wispr cleanup-eval fixtures.toml`
+  (format: [dev/cleanup-fixtures.toml](dev/cleanup-fixtures.toml)).
+
+### Text insertion
+
+With the default `method = "type"`, the text is typed through
+`zwp_virtual_keyboard_v1` with a short-lived keymap. It types the same way in
+editors, browsers and terminals.
+
+- **Line breaks** are typed as Shift+Return. A terminal may still run a
+  command on it, so set `newline = "space"` if you dictate into shells.
+- **Emoji** may not type in Chromium-based apps. The clipboard always has the
+  exact text.
+- **`method = "paste"`** sends `paste_chord` instead. Terminals usually need
+  `"ctrl+shift+v"`.
+- **The clipboard is replaced** and not restored.
+- **Success** only means the compositor received the keys. Wayland can't
+  confirm that the app inserted them. If insertion fails, the result stays
+  ready for a manual `insert` or `copy`.
+
+### Themes
+
+The overlay is styled with GTK CSS. `overlay.theme` loads your stylesheet on
+top of the built-in one, and your rules override any built-in rule.
+
+```sh
+wayland-wispr default-theme > ~/.config/wayland-wispr/theme.css   # start from the default
+```
+
+```toml
+[overlay]
+theme = "theme.css"            # one stylesheet, relative to config.toml
+
+# or light/dark variants, switched live
+[overlay.theme]
+light = "light.css"
+dark = "dark.css"              # an omitted variant uses the default theme
+```
+
 ```nix
-# home-manager: the defaults already point at this server
-services.wayland-wispr.settings.cleanup = {
-  base_url = "http://127.0.0.1:11434/v1"; # default
-  model = "qwen2.5:7b-instruct";          # default
-  # reasoning_effort = "none";            # for thinking models such as Qwen3.x
+# home-manager: Nix paths work, and the bundled example is in the package
+services.wayland-wispr.settings.overlay.theme = {
+  light = "${config.services.wayland-wispr.package}/share/wayland-wispr/themes/light.css";
+  dark = ./wispr-dark.css;
 };
 ```
 
-Notes:
+- **Classes:** `.pill` carries the state classes `.recording`, `.processing`,
+  `.ready` and `.error`. Inside it are `.dot`, `.wave` (bar colour), `.time`,
+  `.status`, `.detail`, `.step` (with `.pending`, `.active`, `.done`) and
+  `spinner.busy`.
+- **Light/dark switching:** variants follow
+  [darkman](https://darkman.whynothugo.nl/) over D-Bus. Without darkman they
+  follow the XDG portal's `color-scheme`, and without either they use `dark`.
+- **Your rules beat every built-in rule** for the same property, regardless of
+  selector specificity. A plain `.dot { background-color: … }` therefore also
+  replaces the recording and processing colours, so restate the state rules
+  as [themes/light.css](themes/light.css) does.
+- **Background:** a background colour in your theme replaces
+  `overlay.opacity`. `overlay.scale` only scales the built-in sizes.
+- **Size:** the pill's width is measured once at startup. Variants should
+  change colours, not sizes or fonts.
+- **Shadows** need room: give `window.wispr` some padding. That padding adds to
+  `overlay.margin`.
 
-- The first rebuild pulls the model in the background. Check progress with
-  `journalctl -u ollama-model-loader`. Until the pull finishes, cleanup fails
-  and the raw transcript is used. Check the result with
-  `wayland-wispr cleanup "ähm also das ist, äh, ein Test"`.
-- `wayland-wispr.service` is a user unit and cannot be ordered after the system
-  `ollama.service`. No ordering is needed: requests are made per dictation, and
-  `cleanup.preload` loads the model while you speak.
-- Whisper and the LLM share VRAM when both run on the GPU. Check `ollama ps`
-  for `100% GPU`; see the notes under [LLM cleanup](#llm-cleanup) for sizing.
-- Ollama listens on loopback by default. Keep it that way: setting `host` to
-  `0.0.0.0` exposes an unauthenticated API to the network. Only set
-  `openFirewall` if that is intended.
-- On machines without a usable GPU, choose a small model (e.g.
-  `qwen2.5:3b-instruct`) or set `cleanup.enabled = false`.
+### Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Service doesn't start | `journalctl --user -u wayland-wispr`. Is `WAYLAND_DISPLAY` in `systemctl --user show-environment`? |
+| No overlay / nothing typed | `wayland-wispr probe`: the compositor lacks a required protocol |
+| "no speech" | `wayland-wispr devices`, then set `audio.device`. Lower `audio.silence_threshold_dbfs` for quiet microphones. |
+| Wrong language or translated output | Set `languages = ["de", "en"]` and keep `language = "auto"` |
+| "Ready (not cleaned up)" | `wayland-wispr status` shows `cleanup_error`. Is the LLM server running and the model pulled? |
+| First characters missing or keybinding modifiers leak into the text | Increase `injection.pre_insert_delay_ms` |
+| Config rejected | `wayland-wispr check-config` shows the error and the model and theme files it resolves |
+
+Logs use `RUST_LOG` (default `info`), e.g. `RUST_LOG=debug wayland-wispr run`.
+
+## Configuration
+
+The config file is `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, or the file
+given with `--config` / `WAYLAND_WISPR_CONFIG`. All keys are optional.
+Unknown keys are errors. Relative paths are relative to the config file. Only
+`run` reads the config, so restart the service after changing it.
+[config.example.toml](config.example.toml) is a commented template.
+
+### `[overlay]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `layer` | `"overlay"` | Layer-shell layer: `"overlay"` or `"top"` |
+| `position` | `"bottom"` | `top-left`, `top`, `top-right`, `left`, `center`, `right`, `bottom-left`, `bottom`, `bottom-right` |
+| `margin` | `48` | Distance in logical pixels from the anchored edge(s) |
+| `margin_x`, `margin_y` | `margin` | Separate horizontal and vertical margins |
+| `output` | compositor's choice | Output connector name, e.g. `"DP-1"` |
+| `scale` | `1.0` | Size of the pill (0.5–4). Margins are not scaled. |
+| `opacity` | `0.88` | Background opacity of the pill. Text stays opaque. |
+| `theme` | built-in | A CSS path, or `{ light = …, dark = … }`; see [Themes](#themes) |
+
+### `[recording]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `max_seconds` | `120` | Recording stops automatically after this many seconds (1–3600) |
+
+### `[audio]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `host` | `"auto"` | `"auto"` (PipeWire if reachable, else ALSA), `"pipewire"` or `"alsa"` |
+| `device` | system default | Name or ID from `wayland-wispr devices` |
+| `min_seconds` | `0.3` | Shorter recordings are rejected |
+| `silence_threshold_dbfs` | `-50.0` | Recordings quieter than this are rejected as "no speech" |
+
+### `[transcription]` and `[transcription.whisper]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `backend` | `"whisper"` | `"whisper"` (local whisper.cpp) or `"fake"` (placeholder text for UI tests) |
+| `whisper.model` | `"base-q5_1"` | Model name, resolved to `<models_dir>/ggml-<model>.bin` |
+| `whisper.models_dir` | `$XDG_DATA_HOME/wayland-wispr/models` | Directory for named models |
+| `whisper.model_path` | – | Explicit model file. Overrides `model` and `models_dir`. |
+| `whisper.device` | `"cpu"` | `"cpu"` or `"gpu"` (needs the Vulkan build) |
+| `whisper.gpu_device` | `0` | GPU index as listed by `bench` |
+| `whisper.flash_attn` | `true` | Use flash attention |
+| `whisper.threads` | cores, at most 8 | CPU threads |
+| `whisper.language` | `"auto"` | `"auto"` or a fixed code such as `"de"` (other speech gets translated) |
+| `whisper.languages` | `[]` (any) | With `"auto"`: only choose among these |
+| `whisper.initial_prompt` | – | Vocabulary hints, e.g. `"Names: makussu, riverfx, fenster."` |
+| `whisper.beam_size` | `1` | `1` = greedy (fast), `5` = beam search (more accurate, slower) |
+| `whisper.keep_loaded` | `"idle"` | `"always"`, `"idle"`, or `"never"` (unload after each use) |
+| `whisper.idle_unload_secs` | `300` | With `"idle"`: free (V)RAM after this long unused |
+| `whisper.preload` | `true` | Start loading the model when recording starts |
+
+### `[cleanup]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enabled` | `true` | Run LLM cleanup after transcription |
+| `base_url` | `"http://127.0.0.1:11434/v1"` | OpenAI-compatible API base. `/chat/completions` is appended. Non-local hosts need https. |
+| `model` | `"qwen2.5:7b-instruct"` | Model name as the server knows it |
+| `reasoning_effort` | – | `"none"` for thinking models such as Qwen3.x |
+| `api_key_env` | – | Environment variable holding a bearer token |
+| `allow_insecure_http` | `false` | Allow `http://` to non-local hosts (sends text unencrypted) |
+| `temperature` | `0.0` | Sampling temperature |
+| `connect_timeout_ms` | `1000` | Connection timeout |
+| `timeout_secs` | `30` | Deadline per request, including a cold model load |
+| `min_words` | `4` | Shorter transcripts are used as-is |
+| `preload` | `true` | Ask a local server to load the model when recording starts |
+| `prompt_file` | built-in | TOML file that replaces the built-in prompt and examples |
+
+### `[injection]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `on_ready` | `"insert"` | When a result is ready: `"insert"` (copy and type), `"copy"`, or `"none"` |
+| `method` | `"type"` | `"type"` (virtual keyboard) or `"paste"` (send `paste_chord`) |
+| `newline` | `"shift_enter"` | How line breaks are typed: `"shift_enter"`, `"enter"` or `"space"` |
+| `type_delay_ms` | `2` | Pause after each typed character |
+| `paste_chord` | `"ctrl+v"` | With `"paste"`, e.g. `"ctrl+shift+v"` for terminals |
+| `pre_insert_delay_ms` | `150` | Time to release the triggering keybinding before typing |
+| `key_delay_ms` | `10` | Delay after keymap changes and while a chord is held |
+
+### `[debug]`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `fake_processing_ms` | `1500` | How long the `fake` backend "processes" |
+| `fake_transcript` | placeholder | Text returned by the `fake` backend |
+| `save_recordings_dir` | – | Save every normalised recording (16 kHz mono WAV). Off by default. |
+
+## Command reference
+
+```text
+wayland-wispr run                 resident process with overlay (the service runs this)
+wayland-wispr toggle              start recording / stop and process
+wayland-wispr start | stop        push-to-talk press / release
+wayland-wispr cancel              discard recording, processing or result (alias: abort)
+wayland-wispr insert [--raw]      copy the ready result and type/paste it into the focused app
+wayland-wispr copy [--raw]        copy the ready result to the clipboard
+wayland-wispr status              JSON state of the running instance (no transcript text)
+
+wayland-wispr probe [--json]      check the compositor's Wayland protocols
+wayland-wispr devices [--json]    list microphones
+wayland-wispr check-config        validate the config, show resolved model and theme files
+wayland-wispr default-theme       print the built-in overlay CSS
+wayland-wispr bench <wav>         load time, latency, RAM/VRAM of a whisper model
+                                  [--model, --model-path, --device, --beam-size, --language, --threads, --runs]
+wayland-wispr cleanup [text]      clean up a text (or stdin) with the configured LLM
+wayland-wispr cleanup-eval <file> compare cleanup models/prompts on a fixtures file
+```
+
+All commands accept `--config <path>`. Client commands talk to `run` over
+`$XDG_RUNTIME_DIR/wayland-wispr/control.sock`, a private socket that only
+accepts connections from the same user.
 
 ## Development
 
 ```sh
-nix develop
-# Or, with direnv installed:
-direnv allow
+nix develop        # or: direnv allow
 ```
 
-The flake pins nixpkgs in `flake.lock` and provides development shells for
-`x86_64-linux` and `aarch64-linux`. It includes:
+The dev shell provides the Rust toolchain, GTK4 and gtk4-layer-shell,
+PipeWire/ALSA, the whisper.cpp build tools (CMake, Clang, Vulkan headers,
+`glslc`) and `wayland-info`. On x86_64 it sets `GGML_AVX2` and related flags,
+because Nix's compiler wrapper strips `-march=native`. Without them
+whisper.cpp would build without SIMD and run about 10× slower. After changing
+`GGML_*` variables, run `cargo clean -p whisper-rs-sys`.
 
-- Rust, Cargo, rustfmt, Clippy, rust-analyzer, and Rust library sources.
-- GTK4 and gtk4-layer-shell for a Wayland overlay, plus GTK schemas and icons.
-- PipeWire and ALSA libraries for CPAL microphone capture. `audio.host = "auto"`
-  uses the native PipeWire host when its socket is reachable and logs why it
-  fell back to ALSA otherwise.
-- CMake, Ninja, Clang, and libclang for `whisper-rs` builds and bindgen, plus
-  Vulkan headers/loader and `glslc` for `--features whisper-vulkan`. On x86_64
-  the shell sets `GGML_AVX2` & co.: Nix's compiler wrapper strips
-  `-march=native`, which would otherwise build whisper.cpp without SIMD
-  (~10x slower). After changing `GGML_*` variables run
-  `cargo clean -p whisper-rs-sys`.
-- OpenSSL (unused so far; the cleanup HTTP client uses rustls).
-- Wayland/xkbcommon libraries and `wayland-info` for protocol inspection.
-  Clipboard/input will use native Rust libraries, not subprocess tools.
-
-### Iterating from this repo
-
-Inside the dev shell (direnv or `nix develop` from the repo root),
-`WAYLAND_WISPR_CONFIG` points at [dev/config.toml](dev/config.toml), so the app
-uses the repo's config instead of `~/.config`. `--config <path>` still wins;
-outside the dev shell the XDG path applies. The resident process logs which
-config it loaded.
+Inside the shell, `WAYLAND_WISPR_CONFIG` points at
+[dev/config.toml](dev/config.toml). That config saves recordings to
+`dev/recordings/` and expects models in `dev/models/` (both gitignored).
 
 ```sh
-# terminal 1: edit dev/config.toml, then (re)start
-cargo run -- run
-
-# terminal 2: drive it (or bind these in fenster to the absolute
-# path of target/debug/wayland-wispr)
-cargo run -q -- toggle      # start; toggle again to stop → transcribes → types into focus
+cargo run --features whisper-vulkan -- run   # terminal 1 (or without the feature for CPU)
+cargo run -q -- toggle                       # terminal 2: start, then stop → transcribe → type
 cargo run -q -- status
-cargo run -q -- insert      # focus your target window first, or use a keybinding
-cargo run -q -- copy
-cargo run -q -- cancel
 ```
 
-The dev config saves every normalized recording (16 kHz mono WAV, private
-permissions) to `dev/recordings/` (gitignored) so you can listen to what a model
-would receive, e.g. `pw-play dev/recordings/<file>.wav`. Recordings shorter than
-`audio.min_seconds` or quieter than `audio.silence_threshold_dbfs` end in an
-error instead of a result. Set `transcription.backend = "fake"` (and optionally
-`debug.fake_transcript`) to test the UI/insertion without a model.
-
-The dev config expects `dev/models/ggml-large-v3-turbo-q5_0.bin` on the GPU, so
-run the resident process with `cargo run --features whisper-vulkan -- run`
-(client commands work from either build). `cargo test` needs no model;
-`WAYLAND_WISPR_TEST_MODEL=dev/models/ggml-base-q5_1.bin cargo test` adds a
-real-model cancellation test.
-Outside the dev config, recordings are never written to disk.
-Config changes require restarting `run`; client commands don't read the config.
-
-Check the environment:
+To test the UI and insertion without a model, set
+`transcription.backend = "fake"`.
 
 ```sh
+cargo test                                                    # no model needed
+WAYLAND_WISPR_TEST_MODEL=dev/models/ggml-base-q5_1.bin cargo test   # + real-model test
 nix flake check --all-systems --no-build
-nix fmt -- flake.nix nix/*.nix   # nixfmt needs file arguments
-nix develop -c sh -c 'rustc --version; cargo --version; pkg-config --modversion gtk4 gtk4-layer-shell-0 alsa'
+nix fmt -- flake.nix nix/*.nix
 ```
 
-From a running Wayland session, check compositor capabilities:
+| Nix file | Purpose |
+| --- | --- |
+| `nix/default.nix` | Package. `vulkanSupport` enables the GPU build, `ggmlCpuFlags` overrides the SIMD level. |
+| `nix/ggml-cpu.nix` | `GGML_*` flags shared by the package and the shell (x86-64-v3 on x86_64) |
+| `nix/shell.nix` | Dev shell |
+| `nix/service.nix` | home-manager module |
+| `nix/models.nix`, `nix/models.json` | Pinned whisper.cpp models from Hugging Face |
+| `nix/update-models.sh` | Regenerates `models.json` from the Hugging Face API |
 
-```sh
-wayland-info | grep -E 'layer_shell|virtual_keyboard|data_control'
-```
+## License
 
-The dev shell does not enable host services, change input permissions, install
-models, or configure API keys. Keep credentials out of Nix files and Git; use
-runtime environment variables or a user-local secret store. Local Whisper model
-files live outside the repository (or in gitignored `dev/models/`). The GPU
-build needs a host Vulkan driver (RADV on NixOS via `hardware.graphics`).
-
-## Suggested implementation
-
-**Rust + `gtk4` / `gtk4-layer-shell`** is the recommended first implementation:
-mature widgets with a small non-focus-stealing recording/status overlay. It
-requires a compositor exposing `zwlr_layer_shell_v1` (not GNOME/Mutter). Keep
-GTK on its main thread and audio/network/model work off that thread.
-
-1. Build an overlay with keyboard mode `None` and no exclusive screen zone.
-2. Add a CLI `toggle` command communicating with the running app over a Unix
-   socket; bind it in the compositor/window manager. Foreign-toplevel protocols
-   do not provide global shortcuts. The GlobalShortcuts portal is a possible
-   alternative only where the desktop's portal backend implements it.
-3. Capture audio with `cpal`, encode WAV, and transcribe with `whisper-rs` or
-   an OpenAI-compatible `/audio/transcriptions` endpoint. Resample to the local
-   model's required sample rate (typically 16 kHz for Whisper).
-4. Optionally send the transcript to `/chat/completions` for cleanup. Configure
-   transcription and cleanup endpoints/models independently, and make remote
-   processing explicit: it sends audio and/or text off the machine.
-5. Insert through native data-control clipboard + native virtual-keyboard paste
-   where supported. Prefer `wl-clipboard-rs` directly for Wayland-only behavior;
-   `arboard` with `wayland-data-control` is a native alternative, but can fall
-   back to X11. Use `wayland-client` / `wayland-protocols-misc` for keyboard
-   events, with a configurable paste chord (terminals often need `Ctrl+Shift+V`).
-   Investigate direct Unicode typing in a native spike. Missing protocols are
-   explicit errors; subprocess, X11, and uinput workarounds are out of scope.
-
-Start with the overlay and native clipboard/virtual-keyboard capability spike
-before building the transcription pipeline. Use explicit insertion initially:
-Wayland cannot universally identify or restore the original focused text field,
-so automatic insertion after processing could target the wrong application.
+[MIT](LICENSE)
