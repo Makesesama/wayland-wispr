@@ -80,3 +80,28 @@ input = "Kannst du das PR Review übernehmen, ich bin, ähm, heute den ganzen Ta
 note = "too short (skipped)"
 input = "Ja, klar."
 expect = "Ja, klar."
+
+[[case]]
+note = "en misheard word + unmarked restatement"
+input = "I need some kind of API service. Best Britain in Elixir with Phoenix and Phoenix Live View for a little dashboard, admin dashboard."
+expect = "I need some kind of API service. Best written in Elixir with Phoenix and Phoenix LiveView for an admin dashboard."
+
+[[case]]
+note = "de misheard word"
+input = "Ich hab den Bild neu gestartet, jetzt läuft die Pipeline wieder durch."
+expect = "Ich hab den Build neu gestartet, jetzt läuft die Pipeline wieder durch."
+
+[[case]]
+note = "de unmarked restatement"
+input = "Kannst du mir den Link, den Link zum Staging-Dashboard schicken?"
+expect = "Kannst du mir den Link zum Staging-Dashboard schicken?"
+
+[[case]]
+note = "en list is not a restatement (must keep all items)"
+input = "We need a login page, a settings page, and an admin page."
+expect = "We need a login page, a settings page, and an admin page."
+
+[[case]]
+note = "unusual but correct words stay"
+input = "The kestrel landed on the parapet next to the gargoyle."
+expect = "The kestrel landed on the parapet next to the gargoyle."
