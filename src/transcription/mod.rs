@@ -167,9 +167,102 @@ pub fn join_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> String 
     out
 }
 
+/// Subtitle credits Whisper hallucinates from its training data, typically
+/// during trailing silence. Distinctive enough to match anywhere in the
+/// sentence (case-insensitive).
+const HALLUCINATION_MARKERS: &[&str] = &[
+    "amara.org",
+    "untertitel im auftrag des",
+    "untertitelung im auftrag des",
+    "copyright wdr",
+];
+
+/// Sign-offs that are also ordinary speech; only removed when they are the
+/// whole sentence (lowercase, punctuation ignored).
+const HALLUCINATION_SENTENCES: &[&str] = &[
+    "thanks for watching",
+    "thank you for watching",
+    "thank you so much for watching",
+    "danke fürs zuschauen",
+    "vielen dank fürs zuschauen",
+];
+
+/// Remove trailing sentences that are known Whisper hallucinations. Only
+/// the end of the text is checked: these phrases appear where the speech
+/// stopped, and genuine uses mid-text are left alone.
+pub fn strip_hallucinations(text: &str) -> String {
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let start = last_sentence_start(rest);
+        let sentence = rest[start..].to_lowercase();
+        let words = sentence
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let hallucinated = HALLUCINATION_MARKERS.iter().any(|h| sentence.contains(h))
+            || HALLUCINATION_SENTENCES.contains(&words.as_str());
+        if !hallucinated {
+            break;
+        }
+        rest = rest[..start].trim_end();
+    }
+    rest.to_owned()
+}
+
+/// Byte index where the last sentence of `s` starts: after the last `.`,
+/// `!`, `?`, `…`, or newline that is followed by whitespace (so `Amara.org`
+/// is one word), ignoring the final punctuation.
+fn last_sentence_start(s: &str) -> usize {
+    let body = s.trim_end_matches(['.', '!', '?', '…', ' ']);
+    let mut start = 0;
+    let mut chars = body.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let boundary = c == '\n'
+            || (matches!(c, '.' | '!' | '?' | '…')
+                && chars.peek().is_some_and(|(_, next)| next.is_whitespace()));
+        if boundary {
+            start = i + c.len_utf8();
+        }
+    }
+    start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_trailing_hallucinations() {
+        assert_eq!(
+            strip_hallucinations("Hallo zusammen. Untertitel der Amara.org-Community"),
+            "Hallo zusammen."
+        );
+        assert_eq!(
+            strip_hallucinations(
+                "Bis morgen! Untertitel im Auftrag des ZDF, 2017. Untertitel im Auftrag des ZDF, 2017"
+            ),
+            "Bis morgen!"
+        );
+        assert_eq!(strip_hallucinations("Thanks for watching!"), "");
+        assert_eq!(
+            strip_hallucinations("Bis dann. Vielen Dank fürs Zuschauen."),
+            "Bis dann."
+        );
+        // Ordinary speech containing the phrases survives, also as the only
+        // or the last sentence.
+        for real in [
+            "Thanks for watching the kids.",
+            "I said thanks for watching the kids. See you.",
+            "We need the subtitles by Friday.",
+            "Kannst du die Untertitel der Präsentation prüfen?",
+            "Danke fürs Zuschauen bei meinem Vortrag gestern.",
+        ] {
+            assert_eq!(strip_hallucinations(real), real);
+        }
+        assert_eq!(strip_hallucinations("  Ganz normal.  "), "Ganz normal.");
+        assert_eq!(strip_hallucinations(""), "");
+    }
 
     fn fake(delay_ms: u64) -> Transcriber {
         let mut config = Config::default();

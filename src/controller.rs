@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::cleanup::{CleanupStatus, Processed};
 use crate::injection::Action;
 
 pub type SessionId = u64;
@@ -21,6 +22,10 @@ pub enum Command {
     Status,
     Copy,
     Insert,
+    /// Like `Copy`, but the raw transcript instead of the cleaned text.
+    CopyRaw,
+    /// Like `Insert`, but the raw transcript instead of the cleaned text.
+    InsertRaw,
 }
 
 /// Events produced by background work owned by the runtime.
@@ -28,7 +33,7 @@ pub enum Command {
 pub enum Internal {
     ProcessingFinished {
         session: SessionId,
-        result: Result<String, String>,
+        result: Result<Processed, String>,
     },
     RecordingLimitReached {
         session: SessionId,
@@ -55,14 +60,16 @@ pub enum State {
     },
     Ready {
         session: SessionId,
-        text: String,
+        result: Processed,
         /// Why the last copy/insert attempt failed, if it did.
         notice: Option<String>,
     },
     Inserting {
         session: SessionId,
-        text: String,
+        /// Kept so a failed insertion returns to `Ready` with everything.
+        result: Processed,
         action: Action,
+        raw: bool,
     },
     Error {
         session: Option<SessionId>,
@@ -114,6 +121,12 @@ pub struct Status {
     pub result_chars: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
+    /// What LLM cleanup did to the ready result.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cleanup: Option<CleanupStatus>,
+    /// Why cleanup failed and the raw transcript is used instead.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cleanup_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,35 +170,41 @@ impl Controller {
     }
 
     pub fn status(&self) -> Status {
-        let (state, session, result_chars, error) = match &self.state {
+        let (state, session, result, error) = match &self.state {
             State::Idle => (StateKind::Idle, None, None, None),
             State::Recording { session } => (StateKind::Recording, Some(*session), None, None),
             State::Processing { session } => (StateKind::Processing, Some(*session), None, None),
             State::Ready {
                 session,
-                text,
+                result,
                 notice,
             } => (
                 StateKind::Ready,
                 Some(*session),
-                Some(text.chars().count()),
+                Some(result),
                 notice.clone(),
             ),
-            State::Inserting { session, text, .. } => (
-                StateKind::Inserting,
-                Some(*session),
-                Some(text.chars().count()),
-                None,
-            ),
+            State::Inserting {
+                session, result, ..
+            } => (StateKind::Inserting, Some(*session), Some(result), None),
             State::Error { session, message } => {
                 (StateKind::Error, *session, None, Some(message.clone()))
             }
+        };
+        // Length of the text being (or about to be) copied/inserted.
+        let result_chars = match &self.state {
+            State::Inserting {
+                result, raw: true, ..
+            } => Some(result.raw_text().chars().count()),
+            _ => result.map(|r| r.text.chars().count()),
         };
         Status {
             state,
             session,
             result_chars,
             error,
+            cleanup: result.map(|r| r.cleanup),
+            cleanup_error: result.and_then(|r| r.cleanup_error.clone()),
         }
     }
 
@@ -230,29 +249,42 @@ impl Controller {
                 Ok(Some("cancelled"))
             }
 
-            (Command::Copy | Command::Insert, State::Ready { session, text, .. }) => {
-                let action = if cmd == Command::Copy {
-                    Action::Copy
-                } else {
-                    Action::Insert
+            (
+                Command::Copy | Command::Insert | Command::CopyRaw | Command::InsertRaw,
+                State::Ready {
+                    session, result, ..
+                },
+            ) => {
+                let action = match cmd {
+                    Command::Copy | Command::CopyRaw => Action::Copy,
+                    _ => Action::Insert,
                 };
-                let (session, text) = (*session, text.clone());
+                let raw = matches!(cmd, Command::CopyRaw | Command::InsertRaw);
+                let text = if raw {
+                    result.raw_text().to_owned()
+                } else {
+                    result.text.clone()
+                };
+                let (session, result) = (*session, result.clone());
                 out.effects.push(Effect::Inject {
                     session,
                     action,
-                    text: text.clone(),
+                    text,
                 });
                 self.set(
                     State::Inserting {
                         session,
-                        text,
+                        result,
                         action,
+                        raw,
                     },
                     &mut out,
                 );
                 return (None, out);
             }
-            (Command::Copy | Command::Insert, _) => Err("no ready result"),
+            (Command::Copy | Command::Insert | Command::CopyRaw | Command::InsertRaw, _) => {
+                Err("no ready result")
+            }
         };
 
         let (ok, message) = match result {
@@ -271,9 +303,9 @@ impl Controller {
                     return out;
                 }
                 let next = match result {
-                    Ok(text) => State::Ready {
+                    Ok(result) => State::Ready {
                         session,
-                        text,
+                        result,
                         notice: None,
                     },
                     Err(message) => State::Error {
@@ -306,8 +338,9 @@ impl Controller {
             Internal::InjectionFinished { session, result } => {
                 let State::Inserting {
                     session: current,
-                    text,
+                    result: processed,
                     action,
+                    raw,
                 } = &self.state
                 else {
                     return out;
@@ -315,13 +348,15 @@ impl Controller {
                 if *current != session {
                     return out;
                 }
-                let (action, text) = (*action, text.clone());
+                let (action, raw, processed) = (*action, *raw, processed.clone());
                 let (ok, message) = match result {
                     Ok(()) => {
                         self.set(State::Idle, &mut out);
-                        let msg = match action {
-                            Action::Copy => "copied to clipboard",
-                            Action::Insert => "inserted",
+                        let msg = match (action, raw) {
+                            (Action::Copy, false) => "copied to clipboard",
+                            (Action::Copy, true) => "copied raw transcript to clipboard",
+                            (Action::Insert, false) => "inserted",
+                            (Action::Insert, true) => "inserted raw transcript",
                         };
                         (true, msg.to_owned())
                     }
@@ -330,7 +365,7 @@ impl Controller {
                         self.set(
                             State::Ready {
                                 session,
-                                text,
+                                result: processed,
                                 notice: Some(message.clone()),
                             },
                             &mut out,
@@ -380,6 +415,10 @@ impl Controller {
 mod tests {
     use super::*;
 
+    fn plain(text: &str) -> Processed {
+        Processed::uncleaned(text.into(), CleanupStatus::Disabled)
+    }
+
     fn kind(c: &Controller) -> StateKind {
         c.status().state
     }
@@ -396,7 +435,7 @@ mod tests {
         let session = c.status().session.unwrap();
         c.handle_internal(Internal::ProcessingFinished {
             session,
-            result: Ok(text.into()),
+            result: Ok(plain(text)),
         });
         assert_eq!(kind(c), StateKind::Ready);
         session
@@ -423,7 +462,7 @@ mod tests {
 
         let o = c.handle_internal(Internal::ProcessingFinished {
             session: 1,
-            result: Ok("hello".into()),
+            result: Ok(plain("hello")),
         });
         assert!(o.changed);
         assert_eq!(c.status().result_chars, Some(5));
@@ -442,7 +481,7 @@ mod tests {
 
         c.handle_internal(Internal::ProcessingFinished {
             session: 1,
-            result: Ok("x".into()),
+            result: Ok(plain("x")),
         });
         let (r, _) = run(&mut c, Command::Toggle);
         assert!(!r.ok);
@@ -477,7 +516,7 @@ mod tests {
         run(&mut c, Command::Start); // session 2
         let o = c.handle_internal(Internal::ProcessingFinished {
             session: 1,
-            result: Ok("old".into()),
+            result: Ok(plain("old")),
         });
         assert!(!o.changed);
         assert_eq!(c.state(), &State::Recording { session: 2 });
@@ -626,7 +665,7 @@ mod tests {
             c.state(),
             &State::Ready {
                 session: s,
-                text: "keep me".into(),
+                result: plain("keep me"),
                 notice: Some("no virtual keyboard".into())
             }
         );
@@ -657,13 +696,79 @@ mod tests {
     }
 
     #[test]
+    fn raw_commands_use_the_raw_transcript() {
+        let mut c = Controller::new();
+        run(&mut c, Command::Start);
+        run(&mut c, Command::Stop);
+        c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Ok(Processed {
+                text: "Clean.".into(),
+                raw: Some("um clean".into()),
+                cleanup: CleanupStatus::Cleaned,
+                cleanup_error: None,
+            }),
+        });
+        assert_eq!(c.status().cleanup, Some(CleanupStatus::Cleaned));
+
+        let (_, o) = c.handle_command(Command::InsertRaw);
+        assert!(
+            matches!(&o.effects[..], [Effect::Inject { text, action: Action::Insert, .. }] if text == "um clean")
+        );
+        assert_eq!(c.status().result_chars, Some("um clean".len()));
+        let o = c.handle_internal(Internal::InjectionFinished {
+            session: 1,
+            result: Err("nope".into()),
+        });
+        assert!(!o.deferred_reply.unwrap().ok);
+
+        // Back in Ready with both texts; the normal command uses the clean one.
+        let (_, o) = c.handle_command(Command::Copy);
+        assert!(matches!(&o.effects[..], [Effect::Inject { text, .. }] if text == "Clean."));
+        let o = c.handle_internal(Internal::InjectionFinished {
+            session: 1,
+            result: Ok(()),
+        });
+        assert_eq!(
+            o.deferred_reply.unwrap().message.as_deref(),
+            Some("copied to clipboard")
+        );
+
+        // Without a separate raw text, raw commands use the result.
+        ready(&mut c, "same");
+        let (_, o) = c.handle_command(Command::CopyRaw);
+        assert!(matches!(&o.effects[..], [Effect::Inject { text, .. }] if text == "same"));
+    }
+
+    #[test]
+    fn failed_cleanup_is_reported_in_status() {
+        let mut c = Controller::new();
+        run(&mut c, Command::Start);
+        run(&mut c, Command::Stop);
+        c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Ok(Processed {
+                text: "raw words".into(),
+                raw: None,
+                cleanup: CleanupStatus::Failed,
+                cleanup_error: Some("cannot reach server".into()),
+            }),
+        });
+        let status = c.status();
+        assert_eq!(status.state, StateKind::Ready);
+        assert_eq!(status.cleanup, Some(CleanupStatus::Failed));
+        assert_eq!(status.cleanup_error.as_deref(), Some("cannot reach server"));
+        assert_eq!(status.error, None);
+    }
+
+    #[test]
     fn status_never_contains_text() {
         let mut c = Controller::new();
         run(&mut c, Command::Start);
         run(&mut c, Command::Stop);
         c.handle_internal(Internal::ProcessingFinished {
             session: 1,
-            result: Ok("secret words".into()),
+            result: Ok(plain("secret words")),
         });
         let json = serde_json::to_string(&c.status()).unwrap();
         assert!(!json.contains("secret"));

@@ -31,6 +31,17 @@ beam_size = 5
 keep_loaded = "idle"
 idle_unload_secs = 300
 
+[cleanup]
+# Needs `ollama serve` and `ollama pull qwen2.5:7b-instruct`; without it the
+# raw transcript is used. Compare models/prompts with
+# `cargo run -- cleanup-eval dev/cleanup-fixtures.toml --model <name>`.
+enabled = true
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen2.5:7b-instruct"
+# Qwen3.8-27B on the 16 GiB card next to Whisper: a ~3-bit quant, thinking off.
+# model = "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS"
+# reasoning_effort = "none"
+
 [injection]
 paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
 pre_insert_delay_ms = 150

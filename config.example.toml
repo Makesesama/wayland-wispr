@@ -33,6 +33,24 @@ keep_loaded = "idle"           # "always" | "idle" | "never" (unload after each 
 idle_unload_secs = 300         # with "idle": free (V)RAM after this long unused
 preload = true                 # start loading the model when recording starts
 
+[cleanup]
+# LLM cleanup of the transcript (fillers, self-corrections, punctuation, spoken
+# "new line"/"neuer Absatz", lists). Needs an OpenAI-compatible server that you
+# run yourself, e.g. `ollama serve` + `ollama pull qwen2.5:7b-instruct`.
+# If it is unreachable or replies badly, the raw transcript is used.
+enabled = true
+base_url = "http://127.0.0.1:11434/v1"   # Ollama; llama-server: http://127.0.0.1:8080/v1
+model = "qwen2.5:7b-instruct"
+# reasoning_effort = "none"   # required for thinking models (Qwen3.x), else they think for ages
+# api_key_env = "WAYLAND_WISPR_LLM_API_KEY"  # remote providers; plain http only to localhost
+# allow_insecure_http = false # allow http:// to non-local hosts (sends text unencrypted)
+temperature = 0.0
+connect_timeout_ms = 1000
+timeout_secs = 30             # includes a cold model load
+min_words = 4                 # shorter transcripts are used as-is
+preload = true                # load the model on the server when recording starts (local servers only)
+# prompt_file = "/path/prompt.toml"  # replace the built-in prompt (see src/cleanup/prompt.toml)
+
 [injection]
 paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
 pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert

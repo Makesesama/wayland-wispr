@@ -7,8 +7,9 @@ into the active application.
 **Status:** usable end to end with local transcription. The resident
 process, layer-shell overlay, control socket, session state machine, Wayland
 capability probe, microphone capture (native PipeWire, ALSA fallback), local
-whisper.cpp transcription (CPU or Vulkan GPU), and native clipboard/paste
-insertion work. LLM cleanup and the remote API backend are **not implemented
+whisper.cpp transcription (CPU or Vulkan GPU), LLM cleanup through a
+user-run OpenAI-compatible server (e.g. Ollama), and native clipboard/paste
+insertion work. The remote transcription API backend is **not implemented
 yet**. No Nix app package yet.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
@@ -30,7 +31,10 @@ wayland-wispr status          # JSON state (never contains transcript text)
 wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
 wayland-wispr insert          # copy, then send the paste chord to the focused app
+wayland-wispr insert --raw    # same with the raw transcript (also `copy --raw`)
 wayland-wispr bench <wav>     # measure the configured whisper model on this machine
+wayland-wispr cleanup "text"  # run LLM cleanup on a text (or stdin)
+wayland-wispr cleanup-eval dev/cleanup-fixtures.toml  # compare models/prompts
 ```
 
 The control socket is `$XDG_RUNTIME_DIR/wayland-wispr/control.sock` (private
@@ -49,6 +53,7 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
 | `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` paste chord (`wayland-protocols-misc`) |
 | `src/transcription/` | Backend interface + cancellation; `whisper.rs`: whisper.cpp worker thread (lazy load, preload on record, idle unload, de/en-restricted language detection); `model.rs`: model resolution/validation |
+| `src/cleanup/` | LLM cleanup: blocking `ureq` client for streamed `/chat/completions` (cancellable, output-capped), built-in few-shot prompt (`prompt.toml`), reply sanitizing/guards with raw fallback, `cleanup`/`cleanup-eval` commands |
 | `src/bench.rs` | `bench` subcommand: load time, latency, RSS and VRAM per model/device |
 | `src/config.rs` | TOML settings with validation |
 
@@ -88,6 +93,52 @@ cargo run --release -- bench dev/recordings/<file>.wav --model small-q5_1 --devi
 encoder pass (≈ one 30 s window) cannot be interrupted, so cancelling a long CPU
 transcription can take a moment.
 
+## LLM cleanup
+
+After transcription, the text goes to an OpenAI-compatible chat completions
+server that **you run yourself**. Cleanup removes fillers and stutters,
+resolves self-corrections ("at two, actually three" becomes "at three"), fixes
+punctuation, turns spoken "new line"/"neuer Absatz"/"Komma" into formatting,
+and writes enumerations as lists. It is on by default and points at Ollama:
+
+```sh
+ollama serve                      # or services.ollama on NixOS
+ollama pull qwen2.5:7b-instruct   # the default cleanup.model
+```
+
+If the server is not running, slow, or replies with something unusable, the
+**raw transcript is used**. The overlay then shows "Ready (not cleaned up)", and
+`status` reports `"cleanup": "failed"` with the reason. Before Ready, the overlay
+shows "Polishing…". When the cleaned text is wrong, `insert --raw` / `copy --raw`
+use the original transcript. Transcripts shorter than `min_words` skip the LLM.
+
+The model's reply is checked before it is used. The checks strip `<think>`
+blocks, quotes, labels, and code fences. They reject refusals, empty replies,
+replies much longer or shorter than the transcript, and replies made mostly of
+words that were never dictated (translations, answers, rewrites). Trailing
+Whisper hallucinations such as "Untertitel der Amara.org-Community" are removed
+before cleanup.
+
+Notes:
+
+- **Thinking models** (Qwen3.x, Qwen3.8) need `reasoning_effort = "none"`;
+  otherwise they spend the whole budget thinking and the raw text is used.
+- **Ollama unloads idle models after 5 minutes.** `preload = true` sends a tiny
+  request when recording starts, so the model loads while you speak (local
+  servers only, so a paid API is not billed for it). Setting
+  `OLLAMA_KEEP_ALIVE` on the server also works.
+- **Models that don't fit the GPU are split onto the CPU** by Ollama and become
+  slow rather than failing. Check `ollama ps` for `100% GPU`. With Whisper
+  large-v3-turbo loaded, a 16 GiB card fits a 7B model easily. Qwen3.8-27B fits
+  only at about 3 bits (`hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS`).
+- A non-local `base_url` must use https; transcripts are then sent to that
+  server. `api_key_env` names the environment variable holding a bearer token.
+- Tune the prompt by copying [src/cleanup/prompt.toml](src/cleanup/prompt.toml)
+  and setting `prompt_file`. Small models follow examples much better than
+  rules, so add an example rather than another "do not". Measure with
+  `cleanup-eval`; `--model`, `--base-url`, `--reasoning-effort`, and
+  `--prompt-file` override the config.
+
 **Insertion notes.** `copy` and `insert` replace your clipboard (no restoration).
 `insert` targets whatever is focused *when it runs* and reports success once the
 chord was delivered to the compositor — Wayland gives no acknowledgement that
@@ -118,7 +169,7 @@ The flake pins nixpkgs in `flake.lock` and provides development shells for
   `-march=native`, which would otherwise build whisper.cpp without SIMD
   (~10x slower). After changing `GGML_*` variables run
   `cargo clean -p whisper-rs-sys`.
-- OpenSSL for HTTP clients using native TLS; `reqwest` with rustls is also an option.
+- OpenSSL (unused so far; the cleanup HTTP client uses rustls).
 - Wayland/xkbcommon libraries and `wayland-info` for protocol inspection.
   Clipboard/input will use native Rust libraries, not subprocess tools.
 

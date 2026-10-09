@@ -33,6 +33,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
+# Blocking HTTP for the OpenAI-compatible cleanup endpoint (fits the
+# thread-per-worker design; no async runtime). rustls for remote https.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # Local transcription (whisper.cpp). CPU by default; GPU backends via features.
 # raw-api: ggml device registry + encoder-begin callback (see transcription/whisper.rs).
 whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend", "raw-api"] }

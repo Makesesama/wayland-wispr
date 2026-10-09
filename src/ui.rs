@@ -9,6 +9,7 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
+use crate::cleanup::CleanupStatus;
 use crate::config::{Config, OverlayLayer};
 use crate::controller::{SessionId, State};
 use crate::injection::Action;
@@ -70,6 +71,8 @@ pub enum View {
     Ready {
         preview: String,
         notice: Option<String>,
+        /// Cleanup failed; the result is the raw transcript.
+        uncleaned: bool,
     },
     Inserting {
         action: Action,
@@ -85,9 +88,10 @@ impl From<&State> for View {
             State::Idle => View::Hidden,
             State::Recording { session } => View::Recording { session: *session },
             State::Processing { session } => View::Processing { session: *session },
-            State::Ready { text, notice, .. } => View::Ready {
-                preview: preview(text),
+            State::Ready { result, notice, .. } => View::Ready {
+                preview: preview(&result.text),
                 notice: notice.clone(),
+                uncleaned: result.cleanup == CleanupStatus::Failed,
             },
             State::Inserting { action, .. } => View::Inserting { action: *action },
             State::Error { message, .. } => View::Error {
@@ -206,6 +210,11 @@ impl Overlay {
                 notice: Some(notice),
                 ..
             } => ("error", "Insert failed", notice.clone()),
+            View::Ready {
+                preview,
+                uncleaned: true,
+                ..
+            } => ("ready", "Ready (not cleaned up)", preview.clone()),
             View::Ready { preview, .. } => ("ready", "Ready", preview.clone()),
             View::Inserting {
                 action: Action::Copy,

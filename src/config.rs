@@ -28,6 +28,7 @@ pub struct Config {
     pub recording: RecordingConfig,
     pub audio: AudioConfig,
     pub transcription: TranscriptionConfig,
+    pub cleanup: CleanupConfig,
     pub injection: InjectionConfig,
     pub debug: DebugConfig,
 }
@@ -211,6 +212,83 @@ pub enum KeepLoaded {
     Never,
 }
 
+/// LLM cleanup of the raw transcript through an OpenAI-compatible chat
+/// completions endpoint (Ollama, llama-server, a remote provider, …). The
+/// server is run by the user; if it is unreachable, the raw transcript is used.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CleanupConfig {
+    pub enabled: bool,
+    /// API base including the version path; `/chat/completions` is appended.
+    pub base_url: String,
+    /// Model name as the server knows it, e.g. `qwen2.5:7b-instruct` (Ollama).
+    pub model: String,
+    /// Environment variable holding a bearer token; unset = no auth header.
+    pub api_key_env: Option<String>,
+    /// Sent as `reasoning_effort`; `"none"` disables thinking on Qwen3.x and
+    /// other reasoning models (Ollama and llama-server understand it).
+    pub reasoning_effort: Option<String>,
+    pub temperature: f32,
+    pub connect_timeout_ms: u64,
+    /// Deadline for one cleanup request, including a cold model load.
+    pub timeout_secs: u64,
+    /// Transcripts with fewer words are used as-is.
+    pub min_words: usize,
+    /// Send a tiny request when recording starts so the server loads the
+    /// model (and caches the prompt) while the user speaks.
+    pub preload: bool,
+    /// TOML file replacing the built-in system prompt and examples.
+    /// Relative paths are resolved against the config file's directory.
+    pub prompt_file: Option<PathBuf>,
+    /// Allow plain `http://` to non-loopback hosts (transcripts are sent
+    /// unencrypted).
+    pub allow_insecure_http: bool,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "qwen2.5:7b-instruct".into(),
+            api_key_env: None,
+            reasoning_effort: None,
+            temperature: 0.0,
+            connect_timeout_ms: 1000,
+            timeout_secs: 30,
+            min_words: 4,
+            preload: true,
+            prompt_file: None,
+            allow_insecure_http: false,
+        }
+    }
+}
+
+/// Scheme and host of an `http(s)://host[:port]/path` URL.
+pub fn split_url(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let authority = rest.split('/').next()?;
+    if authority.contains(['@', '?', '#']) || authority.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then_some((scheme, host))
+}
+
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct InjectionConfig {
@@ -287,6 +365,7 @@ impl Config {
             &mut config.debug.save_recordings_dir,
             &mut config.transcription.whisper.models_dir,
             &mut config.transcription.whisper.model_path,
+            &mut config.cleanup.prompt_file,
         ] {
             if let Some(p) = dir
                 && p.is_relative()
@@ -375,10 +454,57 @@ impl Config {
                 "transcription.whisper.initial_prompt must be at most 2000 bytes".into(),
             ));
         }
+        self.validate_cleanup()?;
         if self.debug.fake_processing_ms > 60_000 {
             return Err(ConfigError::Invalid(
                 "debug.fake_processing_ms must be at most 60000".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_cleanup(&self) -> Result<(), ConfigError> {
+        let c = &self.cleanup;
+        let invalid = |msg: &str| Err(ConfigError::Invalid(format!("cleanup.{msg}")));
+        if c.base_url.contains(['?', '#']) {
+            return invalid(
+                "base_url must not contain a query or fragment (put keys in api_key_env)",
+            );
+        }
+        let Some((scheme, host)) = split_url(c.base_url.trim()) else {
+            return invalid("base_url must look like \"http://127.0.0.1:11434/v1\"");
+        };
+        if scheme == "http" && !is_loopback_host(host) && !c.allow_insecure_http {
+            return invalid(
+                "base_url sends transcripts over plain http to a non-local host; \
+                 use https or set allow_insecure_http = true",
+            );
+        }
+        if c.model.trim().is_empty() || c.model.len() > 256 {
+            return invalid("model must be a model name such as \"qwen2.5:7b-instruct\"");
+        }
+        if c.api_key_env.as_ref().is_some_and(|v| {
+            v.is_empty() || !v.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        }) {
+            return invalid("api_key_env must be an environment variable name");
+        }
+        if c.reasoning_effort
+            .as_ref()
+            .is_some_and(|r| r.trim().is_empty() || r.len() > 32)
+        {
+            return invalid("reasoning_effort must be a level such as \"none\" or \"low\"");
+        }
+        if !(0.0..=2.0).contains(&c.temperature) {
+            return invalid("temperature must be between 0 and 2");
+        }
+        if !(50..=60_000).contains(&c.connect_timeout_ms) {
+            return invalid("connect_timeout_ms must be between 50 and 60000");
+        }
+        if !(1..=600).contains(&c.timeout_secs) {
+            return invalid("timeout_secs must be between 1 and 600");
+        }
+        if c.min_words > 1000 {
+            return invalid("min_words must be at most 1000");
         }
         Ok(())
     }
@@ -543,6 +669,52 @@ mod tests {
         .unwrap();
         c.validate().unwrap();
         assert_eq!(c.transcription.whisper.device, WhisperDevice::Gpu);
+    }
+
+    #[test]
+    fn validates_cleanup_settings() {
+        for bad in [
+            "[cleanup]\nbase_url = \"localhost:11434\"",
+            "[cleanup]\nbase_url = \"ftp://127.0.0.1/v1\"",
+            "[cleanup]\nbase_url = \"http://192.168.1.5:11434/v1\"",
+            "[cleanup]\nbase_url = \"http://user@127.0.0.1/v1\"",
+            "[cleanup]\nbase_url = \"https://api.example.com/v1?key=secret\"",
+            "[cleanup]\nmodel = \" \"",
+            "[cleanup]\napi_key_env = \"MY-KEY\"",
+            "[cleanup]\ntemperature = 3.0",
+            "[cleanup]\ntimeout_secs = 0",
+            "[cleanup]\nreasoning_effort = \"\"",
+        ] {
+            let c: Config = toml::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        for good in [
+            "[cleanup]\nbase_url = \"http://localhost:11434/v1\"",
+            "[cleanup]\nbase_url = \"http://[::1]:8080/v1\"",
+            "[cleanup]\nbase_url = \"https://api.example.com/v1\"\napi_key_env = \"LLM_KEY\"",
+            "[cleanup]\nbase_url = \"http://192.168.1.5:11434/v1\"\nallow_insecure_http = true",
+            "[cleanup]\nenabled = false\nreasoning_effort = \"none\"",
+        ] {
+            let c: Config = toml::from_str(good).unwrap();
+            c.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn splits_urls() {
+        assert_eq!(
+            split_url("http://127.0.0.1:11434/v1"),
+            Some(("http", "127.0.0.1"))
+        );
+        assert_eq!(split_url("https://[::1]/v1"), Some(("https", "::1")));
+        assert_eq!(
+            split_url("https://example.com"),
+            Some(("https", "example.com"))
+        );
+        assert_eq!(split_url("http:///v1"), None);
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(!is_loopback_host("10.0.0.1"));
     }
 
     #[test]

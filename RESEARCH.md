@@ -402,3 +402,73 @@ insertion, if later enabled, needs an explicit statement of that risk.
 - [river-classic](https://github.com/riverwm/river-classic)
 - [wtype implementation — protocol reference, not an app dependency](https://github.com/atx/wtype/blob/master/main.c)
 - [wtype keycode-collision report/patch](https://github.com/atx/wtype/pull/77)
+
+## 4. LLM cleanup of transcripts
+
+### Is cleanup needed at all?
+
+Whisper already produces punctuation and capitalization. Because it was
+trained on cleaned-up subtitles, it also drops most fillers and repetitions
+(the "intended" transcription style, as opposed to verbatim; see CrisperWhisper).
+It does **not** resolve self-corrections ("at two, actually three"), format
+enumerations, act on spoken commands ("neuer Absatz"), or adapt tone. Those are
+the features Wispr Flow builds with an LLM ("Backtrack", "Smart Formatting").
+`initial_prompt` steers only style and vocabulary: Whisper copies the style of
+the prompt and ignores instructions in it, and only the last 224 tokens count.
+
+### Risks and mitigations
+
+- **Plausible rewrites.** LLMs "fix" misheard words and overcorrect text that
+  is already accurate. Mitigation: keep the raw text (`--raw`) and reject replies
+  made mostly of undictated words.
+- **Small models (≈4–7B) follow examples, not rules.** An identity example
+  (correct text containing jargon) prevents spurious edits. Without explicit
+  examples, English terms in German get translated. Reported failure modes:
+  labels, quotes, Markdown, refusals. All are handled in `sanitize.rs`.
+- **Measured here** (`cleanup-eval`, qwen2.5:7b-instruct): the model still
+  translated "Translate this into English: …" and wrote the poem in "Ignore all
+  previous instructions…", even with similar few-shot examples. Only the
+  deterministic guards (undictated-word ratio, length cap) caught these.
+- **Whisper silence hallucinations** ("Untertitel der Amara.org-Community",
+  "Thanks for watching") are a transcription artifact. They are stripped by a
+  blocklist before cleanup, not by the LLM.
+
+### Serving
+
+In-process inference is impractical: `llama-cpp-2` and `whisper-rs` each
+bundle ggml, so linking both fails with duplicate symbols. The app is therefore
+an HTTP client of a user-run server.
+
+Ollama's OpenAI endpoint (`/v1/chat/completions`) supports streaming,
+`max_tokens`, `temperature`, and `reasoning_effort` (`"none"` disables
+thinking). It cannot set the context length (default 4096 via
+`OLLAMA_CONTEXT_LENGTH`) or `keep_alive` (default 5 min, `OLLAMA_KEEP_ALIVE`),
+hence the preload request. llama-server accepts the same fields.
+
+### Model sizing for the RX 9070 XT (16 GiB, ~13 GiB free next to Whisper)
+
+| Model | File | Fits next to Whisper? |
+| --- | ---: | --- |
+| Qwen2.5-7B-Instruct Q4_K_M / Q6_K | 4.4 / 5.8 GiB | yes |
+| Qwen3.8-27B UD-Q4_K_M | 15.3 GiB | no |
+| Qwen3.8-27B UD-IQ4_XS | 13.3 GiB | no, once KV/compute buffers are added |
+| Qwen3.8-27B UD-Q3_K_XL | 12.2 GiB | borderline |
+| Qwen3.8-27B UD-IQ3_XXS | 10.2 GiB | probably; measure |
+
+Qwen3.8 thinks by default at `xhigh` effort, which takes minutes, so it needs
+`reasoning_effort = "none"`. Its recommended non-thinking `presence_penalty`
+of 1.5 discourages repeating words, which is the opposite of what a copy-edit
+needs; the app sends only `temperature` (default 0). Its vision projector is
+not needed. These numbers are file sizes, not measurements on this card.
+
+### Sources
+
+- [CrisperWhisper: verbatim vs. intended transcription](https://arxiv.org/html/2408.16589v1)
+- [OpenAI Whisper prompting guide](https://cookbook.openai.com/examples/whisper_prompting_guide)
+- [Wispr Flow: Smart Formatting & Backtrack](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack)
+- [Handy: shared post-processing prompts and lessons](https://github.com/cjpais/Handy/discussions/715)
+- [ASR error correction: LLMs overcorrect in the low-error regime](https://arxiv.org/html/2405.15216)
+- [Whisper German subtitle hallucinations](https://github.com/openai/whisper/discussions/679)
+- [llama.cpp/whisper.cpp symbol conflict](https://github.com/ggml-org/llama.cpp/issues/9267)
+- [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility), [FAQ: context length, keep_alive](https://docs.ollama.com/faq)
+- [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B), [unsloth GGUF quants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)

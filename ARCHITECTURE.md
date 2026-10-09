@@ -2,9 +2,10 @@
 
 ## Status and goal
 
-**Status:** Phases 1–3 (overlay, controller/IPC, insertion, microphone capture)
-and Phase 7 (local whisper transcription, chosen local-first over Phase 4) are
-implemented; see the checklist. The API backend and LLM cleanup are still planned.
+**Status:** Phases 1–3 (overlay, controller/IPC, insertion, microphone capture),
+Phase 7 (local whisper transcription, chosen local-first over Phase 4), and
+Phase 5 (LLM cleanup against a user-run OpenAI-compatible server) are
+implemented; see the checklist. The API transcription backend is still planned.
 
 See [RESEARCH.md](RESEARCH.md) for native-library research, source links, and
 remaining uncertainties. Runtime subprocess helpers and X11/uinput compatibility
@@ -32,9 +33,9 @@ compatible. Keep transcription, cleanup, and insertion independently configurabl
 | Audio | `cpal` 0.18 (`pipewire` feature) + `rtrb` | Native PipeWire host by default, ALSA fallback. The stream lives on a capture thread; the realtime callback only pushes f32 samples into a lock-free SPSC ring. |
 | WAV encoding | `hound` | Simple PCM WAV encoding for API uploads and debugging fixtures. |
 | Resampling | `rubato` 5 (`Fft`, fixed ratio) | Whole-clip conversion of device-rate mono audio to 16 kHz after stop; startup delay trimmed by `process_all`. |
-| HTTP / async | Prefer `reqwest` with rustls + `tokio`; validate in a transport spike | Full control of two simple operations. `async-openai` is the researched typed SDK alternative covering both STT and chat; configure its auth/retries/transport deliberately. |
+| HTTP | `ureq` 3 (blocking, rustls) | Chosen for cleanup: fits the existing thread-per-worker design without an async runtime; streamed SSE reads give per-token cancellation. Has a `multipart` feature for Phase 4. `reqwest`/`async-openai` remain alternatives if async is ever needed. |
 | Local transcription | `whisper-rs` 0.16 (whisper.cpp 1.8.3), default feature `local-whisper` | CPU by default; `whisper-vulkan` feature for GPUs. Same code path for small and large models: model, device, and lifetime are per-host config. Quantized models supplied separately. See RESEARCH.md §2 for measurements and pitfalls. |
-| Cleanup | OpenAI-compatible chat completions | Supports remote providers and local servers exposing the same API. Native in-process LLM inference is deferred. |
+| Cleanup | OpenAI-compatible chat completions against a server the user runs (default: Ollama on `127.0.0.1:11434`) | Supports remote providers and local servers exposing the same API. In-process inference is ruled out for now: `llama-cpp-2` and `whisper-rs` both bundle ggml and fail to link together (llama.cpp#9267). The app does not start or manage the server. |
 | Clipboard | Native `wl-clipboard-rs`; `arboard` is an alternative | Focus-free Wayland data-control. Arboard requires `wayland-data-control` and can fall back to X11; prefer direct protocol library for strict Wayland-only behavior. Neither executes `wl-copy`. |
 | Input | Native `wayland-client` + `wayland-protocols-misc` | Use `zwp_virtual_keyboard_v1` for paste chords; research direct typing in a bounded spike. No `wtype`/uinput backend. |
 | Configuration | TOML + `serde` | Typed, human-readable settings under the XDG config directory. |
@@ -402,11 +403,39 @@ Choose local-first Phase 7 instead if remote audio processing is not acceptable.
 
 ### Phase 5 — Optional cleanup
 
-- [ ] Implement independent endpoint/model/auth config and the constrained prompt.
-- [ ] Handle disabled cleanup, empty/unexpected responses, and request failures.
-- [ ] Keep raw text available on cleanup failure; cap output/request sizes.
-- [ ] Test filler words, punctuation, names/numbers, multilingual speech, and
-      dictated instructions that must be treated as content, not model commands.
+Design: the user runs an OpenAI-compatible server (Ollama by default); cleanup
+is on by default and degrades to the raw transcript whenever that server is
+missing or misbehaves. `src/cleanup/`: `client.rs` streams
+`/chat/completions` on a helper thread (cancel returns immediately; the helper
+closes the connection at the next chunk), `prompt.toml` is the built-in
+system prompt + de/en few-shot examples sent as prior turns (static, cacheable
+prefix), `sanitize.rs` repairs/rejects replies, `eval.rs` implements
+`cleanup` / `cleanup-eval`.
+
+- [x] Independent `[cleanup]` endpoint/model/auth (`api_key_env`),
+      `reasoning_effort` (thinking off for Qwen3.x), timeouts, `min_words`,
+      `prompt_file`; plain http only to loopback unless `allow_insecure_http`.
+- [x] Disabled/skipped cleanup, unreachable server, HTTP errors, stream
+      errors, timeouts, thinking-only replies, truncation: all fall back to the
+      raw transcript with a reason (`status.cleanup`, `status.cleanup_error`,
+      overlay "Ready (not cleaned up)").
+- [x] Raw transcript kept next to the cleaned text; `copy --raw` / `insert --raw`.
+- [x] Output capped while streaming (`max_tokens` + character cap); replies
+      sanitized (`<think>`, quotes, labels, fences) and rejected when refusing,
+      empty, far too long/short, or mostly made of undictated words
+      (translations/answers/rewrites).
+- [x] Preload: a 1-token request with the static prompt prefix when
+      recording starts (skipped if used in the last 2 min).
+- [x] Trailing Whisper subtitle hallucinations stripped before cleanup.
+- [x] Mock-server tests (success, non-streaming, 404 message, unreachable,
+      missing key, cap, reasoning, stream error, cancel while server silent).
+- [x] Fixtures (`dev/cleanup-fixtures.toml`) and `cleanup-eval`; first run with
+      Ollama 0.35 + `qwen2.5:7b-instruct` (CPU-only sandbox): 14/16 usable,
+      the poem-injection and translate cases fall back to raw via the guards;
+      "neue Zeile" sometimes becomes a paragraph.
+- [ ] Measure on the RX 9070 XT next to Whisper: 7B latency/VRAM, then
+      Qwen3.8-27B at ~3 bit (`UD-IQ3_XXS`, `reasoning_effort = "none"`).
+- [ ] Manual end-to-end dictation with cleanup on riverfx.
 
 **Acceptance:** cleanup can be bypassed, and a failed cleanup never loses a
 successful transcript. Assess meaning preservation with fixed fixtures.

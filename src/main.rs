@@ -2,6 +2,7 @@ mod app;
 mod audio;
 #[cfg(feature = "local-whisper")]
 mod bench;
+mod cleanup;
 mod config;
 mod controller;
 mod injection;
@@ -47,9 +48,31 @@ enum Cmd {
     /// Print machine-readable state of the running instance as JSON.
     Status,
     /// Copy the ready result to the clipboard (native data-control).
-    Copy,
+    Copy {
+        /// Use the raw transcript instead of the LLM-cleaned text.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Copy the ready result and send the paste chord to the focused application.
-    Insert,
+    Insert {
+        /// Use the raw transcript instead of the LLM-cleaned text.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Clean up a text with the configured LLM (argument or stdin) and print
+    /// the result; timing and outcome go to stderr. Works with cleanup disabled.
+    Cleanup {
+        text: Option<String>,
+        #[command(flatten)]
+        overrides: CleanupArgs,
+    },
+    /// Run cleanup on every case of a fixtures file (e.g.
+    /// dev/cleanup-fixtures.toml) and report results and latency.
+    CleanupEval {
+        fixtures: PathBuf,
+        #[command(flatten)]
+        overrides: CleanupArgs,
+    },
     /// List microphones (input devices) of the configured audio host.
     Devices {
         /// Print JSON instead of a list.
@@ -89,6 +112,34 @@ enum Cmd {
         #[arg(long)]
         threads: Option<u16>,
     },
+}
+
+/// Overrides of `[cleanup]` for the cleanup commands.
+#[derive(Debug, clap::Args)]
+struct CleanupArgs {
+    /// Override cleanup.model (e.g. `qwen2.5:7b-instruct`).
+    #[arg(long)]
+    model: Option<String>,
+    /// Override cleanup.base_url.
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Override cleanup.reasoning_effort (`none` for Qwen3.x).
+    #[arg(long)]
+    reasoning_effort: Option<String>,
+    /// Override cleanup.prompt_file.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+}
+
+impl From<CleanupArgs> for cleanup::eval::Overrides {
+    fn from(a: CleanupArgs) -> Self {
+        Self {
+            model: a.model,
+            base_url: a.base_url,
+            reasoning_effort: a.reasoning_effort,
+            prompt_file: a.prompt_file,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -160,6 +211,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 anyhow::bail!("this build lacks the `local-whisper` feature");
             }
         }
+        Cmd::Cleanup { text, overrides } => {
+            let config = Config::load(cli.config.as_deref())?;
+            return cleanup::eval::once(&config, text, overrides.into());
+        }
+        Cmd::CleanupEval {
+            fixtures,
+            overrides,
+        } => {
+            let config = Config::load(cli.config.as_deref())?;
+            return cleanup::eval::eval(&config, &fixtures, overrides.into());
+        }
         Cmd::Devices { json } => {
             let config = Config::load(cli.config.as_deref())?;
             return devices(&config, json);
@@ -169,8 +231,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Stop => Command::Stop,
         Cmd::Cancel => Command::Cancel,
         Cmd::Status => Command::Status,
-        Cmd::Copy => Command::Copy,
-        Cmd::Insert => Command::Insert,
+        Cmd::Copy { raw: false } => Command::Copy,
+        Cmd::Copy { raw: true } => Command::CopyRaw,
+        Cmd::Insert { raw: false } => Command::Insert,
+        Cmd::Insert { raw: true } => Command::InsertRaw,
     };
 
     let response = ipc::send(&ipc::socket_path()?, command)?;
