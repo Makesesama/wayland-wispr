@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod controller;
+mod injection;
 mod ipc;
 mod probe;
 mod ui;
@@ -19,7 +20,8 @@ use crate::controller::Command;
 #[command(version, about)]
 struct Cli {
     /// Config file (default: $XDG_CONFIG_HOME/wayland-wispr/config.toml).
-    #[arg(long, global = true)]
+    /// The dev shell points this at the repo's dev/config.toml.
+    #[arg(long, global = true, env = "WAYLAND_WISPR_CONFIG")]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -40,9 +42,9 @@ enum Cmd {
     Cancel,
     /// Print machine-readable state of the running instance as JSON.
     Status,
-    /// Copy the ready result to the clipboard (not implemented yet).
+    /// Copy the ready result to the clipboard (native data-control).
     Copy,
-    /// Insert the ready result into the focused application (not implemented yet).
+    /// Copy the ready result and send the paste chord to the focused application.
     Insert,
     /// Report native Wayland protocol support of the current compositor.
     Probe {

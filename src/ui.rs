@@ -11,6 +11,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::config::{Config, OverlayLayer};
 use crate::controller::State;
+use crate::injection::Action;
 
 const APP_ID: &str = "de.makussu.WaylandWispr";
 const PREVIEW_CHARS: usize = 60;
@@ -42,8 +43,16 @@ pub enum View {
     Hidden,
     Recording,
     Processing,
-    Ready { preview: String },
-    Error { message: String },
+    Ready {
+        preview: String,
+        notice: Option<String>,
+    },
+    Inserting {
+        action: Action,
+    },
+    Error {
+        message: String,
+    },
 }
 
 impl From<&State> for View {
@@ -52,9 +61,11 @@ impl From<&State> for View {
             State::Idle => View::Hidden,
             State::Recording { .. } => View::Recording,
             State::Processing { .. } => View::Processing,
-            State::Ready { text, .. } => View::Ready {
+            State::Ready { text, notice, .. } => View::Ready {
                 preview: preview(text),
+                notice: notice.clone(),
             },
+            State::Inserting { action, .. } => View::Inserting { action: *action },
             State::Error { message, .. } => View::Error {
                 message: message.clone(),
             },
@@ -144,7 +155,17 @@ impl Overlay {
                 ("recording", "Recording", "0:00".to_owned())
             }
             View::Processing => ("processing", "Transcribing…", String::new()),
-            View::Ready { preview } => ("ready", "Ready", preview.clone()),
+            View::Ready {
+                notice: Some(notice),
+                ..
+            } => ("error", "Insert failed", notice.clone()),
+            View::Ready { preview, .. } => ("ready", "Ready", preview.clone()),
+            View::Inserting {
+                action: Action::Copy,
+            } => ("processing", "Copying…", String::new()),
+            View::Inserting {
+                action: Action::Insert,
+            } => ("processing", "Pasting…", String::new()),
             View::Error { message } => ("error", "Error", message.clone()),
         };
         self.pill.add_css_class(class);

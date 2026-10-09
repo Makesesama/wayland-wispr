@@ -5,9 +5,10 @@ an OpenAI-compatible API, optionally polish with an LLM, then insert the result
 into the active application.
 
 **Status:** early skeleton. The resident process, layer-shell overlay, control
-socket, session state machine, and Wayland capability probe work. Audio capture,
-transcription, cleanup, and clipboard/insertion are **not implemented yet** —
-stopping a recording produces a placeholder transcript. No Nix app package yet.
+socket, session state machine, Wayland capability probe, and native
+clipboard/paste insertion work. Audio capture, transcription, and cleanup are
+**not implemented yet** — stopping a recording produces a placeholder transcript
+(configurable via `debug.fake_transcript`). No Nix app package yet.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
 Wayland constraints, and phased implementation checklist with acceptance criteria.
@@ -25,7 +26,8 @@ wayland-wispr toggle          # start recording / stop and process
 wayland-wispr start | stop    # push-to-talk press / release
 wayland-wispr cancel          # discard recording, processing, or ready result
 wayland-wispr status          # JSON state (never contains transcript text)
-wayland-wispr copy | insert   # placeholders: not implemented yet
+wayland-wispr copy            # put the ready result on the clipboard
+wayland-wispr insert          # copy, then send the paste chord to the focused app
 ```
 
 The control socket is `$XDG_RUNTIME_DIR/wayland-wispr/control.sock` (private
@@ -41,7 +43,16 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/ipc.rs` | Versioned, size-bounded JSON-line Unix socket protocol |
 | `src/ui.rs` | GTK4 layer-shell pill (`KeyboardMode::None`, exclusive zone 0) |
 | `src/probe.rs` | Native `wayland-client` global probe on its own connection |
+| `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` paste chord (`wayland-protocols-misc`) |
 | `src/config.rs` | TOML settings with validation |
+
+**Insertion notes.** `copy` and `insert` replace your clipboard (no restoration).
+`insert` targets whatever is focused *when it runs* and reports success once the
+chord was delivered to the compositor — Wayland gives no acknowledgement that
+the app actually pasted. On failure the result stays ready for a manual retry;
+nothing is retried automatically. Terminals usually need
+`injection.paste_chord = "ctrl+shift+v"`. The paste uses a fixed US keymap on a
+short-lived virtual keyboard, independent of your layout.
 
 ## Development
 
@@ -62,6 +73,31 @@ The flake pins nixpkgs in `flake.lock` and provides development shells for
 - OpenSSL for HTTP clients using native TLS; `reqwest` with rustls is also an option.
 - Wayland/xkbcommon libraries and `wayland-info` for protocol inspection.
   Clipboard/input will use native Rust libraries, not subprocess tools.
+
+### Iterating from this repo
+
+Inside the dev shell (direnv or `nix develop` from the repo root),
+`WAYLAND_WISPR_CONFIG` points at [dev/config.toml](dev/config.toml), so the app
+uses the repo's config instead of `~/.config`. `--config <path>` still wins;
+outside the dev shell the XDG path applies. The resident process logs which
+config it loaded.
+
+```sh
+# terminal 1: edit dev/config.toml, then (re)start
+cargo run -- run
+
+# terminal 2: drive it (or bind these in fenster to the absolute
+# path of target/debug/wayland-wispr)
+cargo run -q -- toggle      # start; toggle again to stop → Ready after fake_processing_ms
+cargo run -q -- status
+cargo run -q -- insert      # focus your target window first, or use a keybinding
+cargo run -q -- copy
+cargo run -q -- cancel
+```
+
+The dev config uses `debug.fake_transcript` (Unicode, emoji, newline, tab) as the
+result text, so clipboard/paste behavior can be tested before audio exists.
+Config changes require restarting `run`; client commands don't read the config.
 
 Check the environment:
 

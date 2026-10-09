@@ -16,8 +16,16 @@ async-channel = "2.5"
 # Native Wayland protocol access on a separate connection (pure-Rust backend,
 # so it does not interfere with gtk4-layer-shell's libwayland link order).
 wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wl-clipboard-rs = "0.9"
+xkbcommon = { version = "0.9", default-features = false }
+# Native PipeWire host (preferred by default_host), ALSA as fallback.
+cpal = { version = "0.18", features = ["pipewire"] }
+rubato = "5"
+hound = "3.5"
+rtrb = "0.4"
 
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
@@ -25,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
-rustix = { version = "1.1", features = ["net", "process", "fs"] }
+rustix = { version = "1.1", features = ["net", "process", "fs", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

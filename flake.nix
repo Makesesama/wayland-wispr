@@ -41,6 +41,7 @@
               gsettings-desktop-schemas
               adwaita-icon-theme
               alsa-lib
+              pipewire
               wayland
               libxkbcommon
               openssl
@@ -62,6 +63,12 @@
                 ]
               }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+
+              # Iterate with the repo's dev config instead of ~/.config.
+              # Set when entered from the repo root (direnv always does this).
+              if [ -z "''${WAYLAND_WISPR_CONFIG:-}" ] && [ -f "$PWD/dev/config.toml" ]; then
+                export WAYLAND_WISPR_CONFIG="$PWD/dev/config.toml"
+              fi
             '';
           };
         }

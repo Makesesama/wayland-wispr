@@ -17,7 +17,7 @@ use crate::controller::{Command, Reply, Status};
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: u64 = 4096;
 const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(2);
-const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
@@ -206,7 +206,7 @@ where
             )),
             Ok(req) => match handler(req.command) {
                 Some(reply) => reply.into(),
-                None => Response::error("controller is shutting down"),
+                None => Response::error("no reply from controller (timed out or shutting down)"),
             },
         },
     };
@@ -275,7 +275,7 @@ mod tests {
         std::thread::spawn(move || {
             let controller = Mutex::new(Controller::new());
             serve(listener, |cmd| {
-                Some(controller.lock().unwrap().handle_command(cmd).0)
+                controller.lock().unwrap().handle_command(cmd).0
             });
         });
         guard

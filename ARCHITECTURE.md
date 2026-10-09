@@ -344,6 +344,15 @@ assumptions before investing in inference. All unchecked items are future work.
       virtual-keyboard paste in editor/browser/terminal, and physical modifier
       cleanup. Evaluate direct Unicode typing separately; record actual riverfx
       capabilities before implementing the full pipeline.
+      - [x] riverfx advertises `zwlr_layer_shell_v1` v4,
+            `zwp_virtual_keyboard_manager_v1` v1, `ext_data_control_manager_v1` v1,
+            `zwlr_data_control_manager_v1` v2, one `wl_seat`.
+      - [x] `copy`/`insert` implemented (wl-clipboard-rs + virtual-keyboard chord);
+            verified on headless sway (Unicode/multiline clipboard round trip,
+            balanced Ctrl+V with modifiers cleared).
+      - [ ] Manual riverfx test: editor, browser, terminal (`ctrl+shift+v`),
+            physical keyboard/modifiers afterwards.
+      - [ ] Direct Unicode typing spike (optional).
 
 **Acceptance:** `cargo run -- run` shows a controllable indicator on riverfx;
 an editor retains focus and typed input while it changes state. Check using a

@@ -7,12 +7,12 @@ use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("could not read config {path}: {source}")]
+    #[error("could not read config {path}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("invalid config {path}: {source}")]
+    #[error("invalid config {path}")]
     Parse {
         path: PathBuf,
         source: toml::de::Error,
@@ -26,6 +26,7 @@ pub enum ConfigError {
 pub struct Config {
     pub overlay: OverlayConfig,
     pub recording: RecordingConfig,
+    pub injection: InjectionConfig,
     pub debug: DebugConfig,
 }
 
@@ -69,15 +70,39 @@ impl Default for RecordingConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct InjectionConfig {
+    /// Chord sent after copying, e.g. `ctrl+v`, `ctrl+shift+v`, `shift+Insert`.
+    pub paste_chord: String,
+    /// Delay before the paste chord, so the triggering keybinding is released.
+    pub pre_insert_delay_ms: u64,
+    /// Delay between synthetic key events.
+    pub key_delay_ms: u64,
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self {
+            paste_chord: "ctrl+v".into(),
+            pre_insert_delay_ms: 150,
+            key_delay_ms: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct DebugConfig {
     /// Duration of the placeholder processing stage until real backends exist.
     pub fake_processing_ms: u64,
+    /// Placeholder result text, e.g. to test Unicode/multiline insertion.
+    pub fake_transcript: Option<String>,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
         Self {
             fake_processing_ms: 1500,
+            fake_transcript: None,
         }
     }
 }
@@ -103,9 +128,12 @@ impl Config {
             Err(source) => return Err(ConfigError::Read { path, source }),
         };
 
-        let config: Self =
-            toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?;
+        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.clone(),
+            source,
+        })?;
         config.validate()?;
+        tracing::info!(path = %path.display(), "loaded config");
         Ok(config)
     }
 
@@ -118,6 +146,18 @@ impl Config {
         if !(0..=2000).contains(&self.overlay.margin_bottom) {
             return Err(ConfigError::Invalid(
                 "overlay.margin_bottom must be between 0 and 2000".into(),
+            ));
+        }
+        if let Err(e) = self
+            .injection
+            .paste_chord
+            .parse::<crate::injection::chord::Chord>()
+        {
+            return Err(ConfigError::Invalid(format!("injection.paste_chord: {e}")));
+        }
+        if self.injection.pre_insert_delay_ms > 5000 || self.injection.key_delay_ms > 500 {
+            return Err(ConfigError::Invalid(
+                "injection delays must be at most 5000 ms (pre-insert) and 500 ms (per key)".into(),
             ));
         }
         if self.debug.fake_processing_ms > 60_000 {
@@ -182,6 +222,21 @@ mod tests {
         assert!(toml::from_str::<Config>("[overlay]\nfoo = 1").is_err());
         let c: Config = toml::from_str("[recording]\nmax_seconds = 0").unwrap();
         assert!(c.validate().is_err());
+        let c: Config = toml::from_str("[injection]\npaste_chord = \"meta+v\"").unwrap();
+        assert!(c.validate().is_err());
+        let c: Config = toml::from_str("[injection]\npaste_chord = \"ctrl+shift+v\"").unwrap();
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn example_and_dev_configs_are_valid() {
+        for text in [
+            include_str!("../config.example.toml"),
+            include_str!("../dev/config.toml"),
+        ] {
+            let c: Config = toml::from_str(text).unwrap();
+            c.validate().unwrap();
+        }
     }
 
     #[test]

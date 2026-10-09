@@ -7,5 +7,11 @@ margin_bottom = 48  # logical pixels from the bottom edge
 [recording]
 max_seconds = 120   # recording stops automatically after this
 
+[injection]
+paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
+pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert
+key_delay_ms = 10
+
 [debug]
 fake_processing_ms = 1500  # placeholder processing delay until real backends exist
+# fake_transcript = "Grüße, 世界 👋\nsecond line"  # test text for copy/insert
