@@ -33,10 +33,22 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
+# Local transcription (whisper.cpp). CPU by default; GPU backends via features.
+# raw-api: ggml device registry + encoder-begin callback (see transcription/whisper.rs).
+whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend", "raw-api"] }
 rustix = { version = "1.1", features = ["net", "process", "fs", "time"] }
+
+[features]
+default = ["local-whisper"]
+# Local whisper.cpp transcription on the CPU.
+local-whisper = ["dep:whisper-rs"]
+# Vulkan GPU acceleration (AMD/Intel/NVIDIA). Needs Vulkan headers, glslc,
+# and the loader at build time (all in the dev shell) and a GPU driver at runtime.
+whisper-vulkan = ["local-whisper", "whisper-rs/vulkan"]
 
 [dev-dependencies]
 tempfile = "3"
 
 [profile.release]
 lto = "thin"
+

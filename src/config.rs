@@ -27,6 +27,7 @@ pub struct Config {
     pub overlay: OverlayConfig,
     pub recording: RecordingConfig,
     pub audio: AudioConfig,
+    pub transcription: TranscriptionConfig,
     pub injection: InjectionConfig,
     pub debug: DebugConfig,
 }
@@ -93,6 +94,123 @@ impl Default for AudioConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranscriptionConfig {
+    pub backend: TranscriptionBackend,
+    pub whisper: WhisperConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptionBackend {
+    /// Local whisper.cpp inference (`local-whisper` build feature).
+    #[default]
+    Whisper,
+    /// Placeholder text after `debug.fake_processing_ms`; for UI/insertion tests.
+    Fake,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WhisperConfig {
+    /// Model name, resolved to `<models_dir>/ggml-<model>.bin`,
+    /// e.g. `large-v3-turbo-q5_0`, `small-q5_1`, `base-q5_1`.
+    pub model: String,
+    /// Explicit model file; overrides `model` / `models_dir`.
+    pub model_path: Option<PathBuf>,
+    /// Directory for named models. Default: `$XDG_DATA_HOME/wayland-wispr/models`.
+    /// Relative paths are resolved against the config file's directory.
+    pub models_dir: Option<PathBuf>,
+    /// `cpu`, or `gpu` (requires a GPU build feature such as `whisper-vulkan`).
+    /// Never falls back silently: a missing GPU is an error.
+    pub device: WhisperDevice,
+    /// GPU index as listed by `wayland-wispr bench`.
+    pub gpu_device: u32,
+    pub flash_attn: bool,
+    /// CPU threads; default: available cores, at most 8.
+    pub threads: Option<u16>,
+    /// Spoken language code (`de`, `en`, …) or `auto`.
+    pub language: String,
+    /// With `language = "auto"`: only pick among these (e.g. `["de", "en"]`).
+    /// Empty: any language Whisper knows.
+    pub languages: Vec<String>,
+    /// Vocabulary/style hint, e.g. names and jargon you use often.
+    pub initial_prompt: Option<String>,
+    /// 1 = greedy decoding (fastest); >1 = beam search with this width.
+    pub beam_size: u8,
+    /// When the model stays in (V)RAM between recordings.
+    pub keep_loaded: KeepLoaded,
+    /// With `keep_loaded = "idle"`: unload after this many seconds unused.
+    pub idle_unload_secs: u64,
+    /// Start loading the model as soon as recording starts.
+    pub preload: bool,
+}
+
+impl Default for WhisperConfig {
+    fn default() -> Self {
+        Self {
+            model: "base-q5_1".into(),
+            model_path: None,
+            models_dir: None,
+            device: WhisperDevice::Cpu,
+            gpu_device: 0,
+            flash_attn: true,
+            threads: None,
+            language: "auto".into(),
+            languages: Vec::new(),
+            initial_prompt: None,
+            beam_size: 1,
+            keep_loaded: KeepLoaded::Idle,
+            idle_unload_secs: 300,
+            preload: true,
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "local-whisper"), allow(dead_code))]
+impl WhisperConfig {
+    /// The model file to load.
+    pub fn resolved_model_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.model_path {
+            return Some(path.clone());
+        }
+        let dir = self.models_dir.clone().or_else(default_models_dir)?;
+        let file = if self.model.ends_with(".bin") {
+            self.model.clone()
+        } else {
+            format!("ggml-{}.bin", self.model)
+        };
+        Some(dir.join(file))
+    }
+
+    pub fn threads(&self) -> u16 {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8) as u16)
+                .unwrap_or(4)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WhisperDevice {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KeepLoaded {
+    /// Load once, never unload.
+    Always,
+    /// Unload after `idle_unload_secs` without use.
+    Idle,
+    /// Unload right after each transcription (frees VRAM, slower start).
+    Never,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct InjectionConfig {
@@ -117,9 +235,9 @@ impl Default for InjectionConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DebugConfig {
-    /// Duration of the placeholder processing stage until real backends exist.
+    /// Duration of the `fake` transcription backend.
     pub fake_processing_ms: u64,
-    /// Placeholder result text, e.g. to test Unicode/multiline insertion.
+    /// Result text of the `fake` backend, e.g. to test Unicode/multiline insertion.
     pub fake_transcript: Option<String>,
     /// If set, every normalized (16 kHz mono) recording is written here as a
     /// private WAV. Relative paths are resolved against the config file's
@@ -163,12 +281,18 @@ impl Config {
             source,
         })?;
         config.validate()?;
-        if let Some(dir) = &config.debug.save_recordings_dir
-            && dir.is_relative()
-        {
-            let base = path.parent().unwrap_or(Path::new("."));
-            let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
-            config.debug.save_recordings_dir = Some(base.join(dir));
+        let base = path.parent().unwrap_or(Path::new("."));
+        let base = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
+        for dir in [
+            &mut config.debug.save_recordings_dir,
+            &mut config.transcription.whisper.models_dir,
+            &mut config.transcription.whisper.model_path,
+        ] {
+            if let Some(p) = dir
+                && p.is_relative()
+            {
+                *p = base.join(&*p);
+            }
         }
         if let Some(dir) = &config.debug.save_recordings_dir {
             tracing::warn!(dir = %dir.display(), "debug: recordings will be saved to disk");
@@ -215,6 +339,42 @@ impl Config {
                 "audio.silence_threshold_dbfs must be between -100 and 0".into(),
             ));
         }
+        let w = &self.transcription.whisper;
+        if w.model.trim().is_empty() || w.model.contains('/') {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.model must be a model name like \"large-v3-turbo-q5_0\"; use model_path for files".into(),
+            ));
+        }
+        if !(1..=16).contains(&w.beam_size) {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.beam_size must be between 1 and 16".into(),
+            ));
+        }
+        if w.threads.is_some_and(|t| !(1..=256).contains(&t)) {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.threads must be between 1 and 256".into(),
+            ));
+        }
+        if !(1..=86_400).contains(&w.idle_unload_secs) {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.idle_unload_secs must be between 1 and 86400".into(),
+            ));
+        }
+        if w.language.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.language must be a code like \"de\" or \"auto\"".into(),
+            ));
+        }
+        if !w.languages.is_empty() && w.language != "auto" {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.languages only applies with language = \"auto\"".into(),
+            ));
+        }
+        if w.initial_prompt.as_ref().is_some_and(|p| p.len() > 2000) {
+            return Err(ConfigError::Invalid(
+                "transcription.whisper.initial_prompt must be at most 2000 bytes".into(),
+            ));
+        }
         if self.debug.fake_processing_ms > 60_000 {
             return Err(ConfigError::Invalid(
                 "debug.fake_processing_ms must be at most 60000".into(),
@@ -233,16 +393,33 @@ impl Config {
 }
 
 fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    Some(
+        xdg_dir("XDG_CONFIG_HOME", ".config")?
+            .join("wayland-wispr")
+            .join("config.toml"),
+    )
+}
+
+/// `$XDG_DATA_HOME/wayland-wispr/models` (fallback `~/.local/share`).
+#[cfg_attr(not(feature = "local-whisper"), allow(dead_code))]
+pub fn default_models_dir() -> Option<PathBuf> {
+    Some(
+        xdg_dir("XDG_DATA_HOME", ".local/share")?
+            .join("wayland-wispr")
+            .join("models"),
+    )
+}
+
+fn xdg_dir(var: &str, home_fallback: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
-                .map(|h| h.join(".config"))
-        })?;
-    Some(base.join("wayland-wispr").join("config.toml"))
+                .map(|h| h.join(home_fallback))
+        })
 }
 
 #[cfg(test)]
@@ -317,6 +494,55 @@ mod tests {
         std::fs::write(&path, "[debug]\nsave_recordings_dir = \"rec\"").unwrap();
         let c = Config::load(Some(&path)).unwrap();
         assert_eq!(c.debug.save_recordings_dir, Some(dir.path().join("rec")));
+    }
+
+    #[test]
+    fn resolves_whisper_model_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[transcription.whisper]\nmodels_dir = \"models\"\nmodel = \"small-q5_1\"",
+        )
+        .unwrap();
+        let c = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            c.transcription.whisper.resolved_model_path(),
+            Some(dir.path().join("models/ggml-small-q5_1.bin"))
+        );
+
+        let mut w = WhisperConfig {
+            model_path: Some("/m/x.bin".into()),
+            ..WhisperConfig::default()
+        };
+        assert_eq!(w.resolved_model_path(), Some(PathBuf::from("/m/x.bin")));
+        w.model_path = None;
+        w.models_dir = Some("/m".into());
+        w.model = "ggml-custom.bin".into();
+        assert_eq!(
+            w.resolved_model_path(),
+            Some(PathBuf::from("/m/ggml-custom.bin"))
+        );
+    }
+
+    #[test]
+    fn validates_whisper_settings() {
+        for bad in [
+            "[transcription.whisper]\nbeam_size = 0",
+            "[transcription.whisper]\nmodel = \"../x\"",
+            "[transcription.whisper]\nlanguage = \"de\"\nlanguages = [\"de\", \"en\"]",
+            "[transcription.whisper]\nidle_unload_secs = 0",
+        ] {
+            let c: Config = toml::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>("[transcription.whisper]\ndevice = \"tpu\"").is_err());
+        let c: Config = toml::from_str(
+            "[transcription]\nbackend = \"whisper\"\n[transcription.whisper]\ndevice = \"gpu\"\nlanguages = [\"de\", \"en\"]\nkeep_loaded = \"always\"",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.transcription.whisper.device, WhisperDevice::Gpu);
     }
 
     #[test]

@@ -3,7 +3,8 @@
 ## Status and goal
 
 **Status:** Phases 1–3 (overlay, controller/IPC, insertion, microphone capture)
-are implemented; see the checklist. Transcription and cleanup are still planned.
+and Phase 7 (local whisper transcription, chosen local-first over Phase 4) are
+implemented; see the checklist. The API backend and LLM cleanup are still planned.
 
 See [RESEARCH.md](RESEARCH.md) for native-library research, source links, and
 remaining uncertainties. Runtime subprocess helpers and X11/uinput compatibility
@@ -32,7 +33,7 @@ compatible. Keep transcription, cleanup, and insertion independently configurabl
 | WAV encoding | `hound` | Simple PCM WAV encoding for API uploads and debugging fixtures. |
 | Resampling | `rubato` 5 (`Fft`, fixed ratio) | Whole-clip conversion of device-rate mono audio to 16 kHz after stop; startup delay trimmed by `process_all`. |
 | HTTP / async | Prefer `reqwest` with rustls + `tokio`; validate in a transport spike | Full control of two simple operations. `async-openai` is the researched typed SDK alternative covering both STT and chat; configure its auth/retries/transport deliberately. |
-| Local transcription | Optional `whisper-rs` | Native whisper.cpp integration; CPU by default, optional Vulkan after benchmarking. Quantized models supplied separately. See RESEARCH.md for RAM/VRAM constraints. |
+| Local transcription | `whisper-rs` 0.16 (whisper.cpp 1.8.3), default feature `local-whisper` | CPU by default; `whisper-vulkan` feature for GPUs. Same code path for small and large models: model, device, and lifetime are per-host config. Quantized models supplied separately. See RESEARCH.md §2 for measurements and pitfalls. |
 | Cleanup | OpenAI-compatible chat completions | Supports remote providers and local servers exposing the same API. Native in-process LLM inference is deferred. |
 | Clipboard | Native `wl-clipboard-rs`; `arboard` is an alternative | Focus-free Wayland data-control. Arboard requires `wayland-data-control` and can fall back to X11; prefer direct protocol library for strict Wayland-only behavior. Neither executes `wl-copy`. |
 | Input | Native `wayland-client` + `wayland-protocols-misc` | Use `zwp_virtual_keyboard_v1` for paste chords; research direct typing in a bounded spike. No `wtype`/uinput backend. |
@@ -422,15 +423,31 @@ successful transcript. Assess meaning preservation with fixed fixtures.
 **Acceptance:** supported targets receive exact text once; unsupported injection
 fails clearly and leaves manual copy available. Normal overlay use steals no focus.
 
-### Phase 7 — Local transcription
+### Phase 7 — Local transcription (done first: local-first)
 
-- [ ] Add feature-gated CPU `whisper-rs` backend and model-path validation.
-- [ ] Reuse audio normalization; keep model loading/inference off the GTK thread.
-- [ ] Support language settings, the native abort callback, and stale-result handling.
-- [ ] Measure RSS/VRAM, latency, and accuracy for multilingual base/small quantized
-      models; evaluate turbo and optional Vulkan with actual hardware budgets.
-- [ ] Test model absence, short/silent clips, architecture compatibility, and
-      memory exhaustion. Do not infer GPU requirements from model-file size.
+Design: one backend, small/large is configuration. `[transcription.whisper]`
+selects model (name → `models_dir/ggml-<name>.bin`, or `model_path`), `device`
+(`cpu`/`gpu` + `gpu_device`), `language`/`languages`, `beam_size`, and the
+model lifetime (`keep_loaded = always | idle | never`, `idle_unload_secs`,
+`preload`). A `whisper` worker thread owns the context and reusable state,
+serializes jobs, preloads when recording starts, and unloads when idle to free
+VRAM for e.g. a local cleanup LLM. GPU mode never falls back to CPU silently.
+
+- [x] Feature-gated `whisper-rs` backend (`local-whisper`, default; `whisper-vulkan`)
+      and model-path validation (existence, ggml magic) at startup.
+- [x] Reuse audio normalization; model loading/inference on the worker thread;
+      overlay shows "Loading model…" vs "Transcribing…".
+- [x] Language settings incl. auto-detection restricted to `languages`
+      (e.g. de/en); cancellation via abort + encoder-begin callbacks
+      (`Effect::AbortProcessing`); stale results still rejected by session ID.
+- [x] `bench` subcommand: load time, latency/RTF, RSS, device-wide VRAM delta.
+- [x] CPU measurements on the dev machine (RESEARCH.md §2).
+- [ ] Vulkan measurements on the RX 7900 XT (turbo, beam 1/5); MacBook CPU (small/base).
+- [ ] Manual end-to-end test on riverfx with a real microphone.
+- [x] Model absence/invalid file, GPU missing (Vulkan build without driver),
+      unknown language codes, CPU-only build asked for GPU: clear errors.
+- [ ] Memory exhaustion behaviour on a nearly full GPU.
+- [ ] Packaging: Nix-fetched models (fixed hashes) and per-host config via Home Manager.
 
 **Acceptance:** transcription works with network unavailable and no API key;
 local STT + disabled/local cleanup never contacts a remote provider. The API-only

@@ -50,6 +50,11 @@ pub enum UiEvent {
         session: SessionId,
         dbfs: f32,
     },
+    /// Processing stage label; ignored unless that session is processing.
+    Stage {
+        session: SessionId,
+        label: &'static str,
+    },
 }
 
 /// What the overlay should display. Owned and `Send`, built off the GTK thread.
@@ -59,7 +64,9 @@ pub enum View {
     Recording {
         session: SessionId,
     },
-    Processing,
+    Processing {
+        session: SessionId,
+    },
     Ready {
         preview: String,
         notice: Option<String>,
@@ -77,7 +84,7 @@ impl From<&State> for View {
         match state {
             State::Idle => View::Hidden,
             State::Recording { session } => View::Recording { session: *session },
-            State::Processing { .. } => View::Processing,
+            State::Processing { session } => View::Processing { session: *session },
             State::Ready { text, notice, .. } => View::Ready {
                 preview: preview(text),
                 notice: notice.clone(),
@@ -108,6 +115,7 @@ struct Overlay {
     meter: gtk4::LevelBar,
     recording_since: Cell<Option<Instant>>,
     recording_session: Cell<Option<SessionId>>,
+    processing_session: Cell<Option<SessionId>>,
 }
 
 impl Overlay {
@@ -165,6 +173,7 @@ impl Overlay {
             meter,
             recording_since: Cell::new(None),
             recording_session: Cell::new(None),
+            processing_session: Cell::new(None),
         }
     }
 
@@ -174,6 +183,7 @@ impl Overlay {
         }
         self.recording_since.set(None);
         self.recording_session.set(None);
+        self.processing_session.set(None);
         self.meter.set_value(0.0);
         self.meter
             .set_visible(matches!(view, View::Recording { .. }));
@@ -188,7 +198,10 @@ impl Overlay {
                 self.recording_session.set(Some(*session));
                 ("recording", "Recording", "0:00".to_owned())
             }
-            View::Processing => ("processing", "Transcribing…", String::new()),
+            View::Processing { session } => {
+                self.processing_session.set(Some(*session));
+                ("processing", "Transcribing…", String::new())
+            }
             View::Ready {
                 notice: Some(notice),
                 ..
@@ -222,6 +235,12 @@ impl Overlay {
             (current - 0.05).max(target)
         };
         self.meter.set_value(next);
+    }
+
+    fn stage(&self, session: SessionId, label: &str) {
+        if self.processing_session.get() == Some(session) {
+            self.status.set_text(label);
+        }
     }
 
     fn tick(&self) {
@@ -284,6 +303,7 @@ pub fn run(config: Config, events: async_channel::Receiver<UiEvent>) -> bool {
                         match event {
                             UiEvent::State(view) => overlay.apply(&view),
                             UiEvent::Level { session, dbfs } => overlay.level(session, dbfs),
+                            UiEvent::Stage { session, label } => overlay.stage(session, label),
                         }
                     }
                     tracing::debug!("controller channel closed; quitting");

@@ -10,6 +10,7 @@ use crate::audio::{self, Capture, CaptureEvent};
 use crate::config::Config;
 use crate::controller::{Command, Controller, Effect, Internal, Reply, SessionId};
 use crate::injection::Injector;
+use crate::transcription::{CancelFlag, Progress, TranscribeError, Transcriber};
 use crate::ui::{UiEvent, View};
 use crate::{ipc, probe, ui};
 
@@ -24,6 +25,7 @@ enum Msg {
 pub fn run(config: Config) -> anyhow::Result<()> {
     check_capabilities()?;
     let injector = Arc::new(Injector::new(&config.injection).context("preparing paste chord")?);
+    let transcriber = Arc::new(Transcriber::new(&config).context("setting up transcription")?);
 
     let socket = ipc::socket_path()?;
     let (listener, socket_guard) = ipc::bind(&socket)?;
@@ -40,7 +42,9 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                 ui: ui_tx,
                 config: Arc::new(config.clone()),
                 injector,
+                transcriber,
                 capture: None,
+                processing: None,
             };
             move || runtime.run(msg_rx)
         })
@@ -98,8 +102,11 @@ struct Runtime {
     ui: async_channel::Sender<UiEvent>,
     config: Arc<Config>,
     injector: Arc<Injector>,
+    transcriber: Arc<Transcriber>,
     /// The microphone capture of the current recording session, if any.
     capture: Option<(SessionId, Capture)>,
+    /// Cancellation handle of the session being processed, if any.
+    processing: Option<(SessionId, CancelFlag)>,
 }
 
 impl Runtime {
@@ -165,6 +172,8 @@ impl Runtime {
                 );
                 // Replacing an older capture cancels it.
                 self.capture = Some((session, capture));
+                // Load the model while the user speaks.
+                self.transcriber.prepare();
             }
             Effect::DiscardCapture { session } => {
                 if self.capture.as_ref().is_some_and(|(s, _)| *s == session) {
@@ -187,10 +196,23 @@ impl Runtime {
                     }
                 };
                 let config = self.config.clone();
+                let transcriber = self.transcriber.clone();
+                let cancel = CancelFlag::default();
+                self.processing = Some((session, cancel.clone()));
+                let ui = self.ui.clone();
                 self.spawn("process", move || Internal::ProcessingFinished {
                     session,
-                    result: process(session, capture, &config),
+                    result: process(session, capture, &config, &transcriber, &cancel, ui),
                 });
+            }
+            Effect::AbortProcessing { session } => {
+                if let Some((s, cancel)) = self.processing.take() {
+                    if s == session {
+                        cancel.cancel();
+                    } else {
+                        self.processing = Some((s, cancel));
+                    }
+                }
             }
             Effect::Inject {
                 session,
@@ -227,12 +249,15 @@ impl Runtime {
     }
 }
 
-/// Stop the capture, normalize the audio, and (for now) return a placeholder
-/// transcript. Blocking; runs on a worker thread.
+/// Stop the capture, normalize the audio, and transcribe it. Blocking; runs
+/// on a worker thread.
 fn process(
     session: SessionId,
     capture: Option<Capture>,
     config: &Config,
+    transcriber: &Transcriber,
+    cancel: &CancelFlag,
+    ui: async_channel::Sender<UiEvent>,
 ) -> Result<String, String> {
     let capture = capture.ok_or("no recording for this session")?;
     let raw = capture.finish()?;
@@ -246,14 +271,25 @@ fn process(
         }
     })?;
 
-    // Transcription backends arrive in Phase 4/7.
-    thread::sleep(config.fake_processing());
-    Ok(config.debug.fake_transcript.clone().unwrap_or_else(|| {
-        format!(
-            "Placeholder transcript: recorded {:.1} s of audio; transcription is not implemented yet.",
-            clip.duration_secs()
-        )
-    }))
+    let progress = Box::new(move |stage| {
+        let label = match stage {
+            Progress::LoadingModel => "Loading model…",
+            Progress::Transcribing => "Transcribing…",
+        };
+        let _ = ui.try_send(UiEvent::Stage { session, label });
+    });
+    match transcriber.transcribe(&clip, cancel, progress) {
+        Ok(transcript) => Ok(transcript.text),
+        Err(e @ TranscribeError::Cancelled) => {
+            // The controller already moved on; this result is ignored.
+            tracing::debug!(session, "transcription cancelled");
+            Err(e.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(session, error = %e, "transcription failed");
+            Err(e.to_string())
+        }
+    }
 }
 
 fn log_reply(command: &str, reply: &Reply) {

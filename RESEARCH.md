@@ -196,6 +196,52 @@ For a local cleanup LLM sharing the GPU, account for both models' resident
 allocations or deliberately unload/serialize them. On integrated/unified-memory
 GPUs, total shared RAM and driver limits matter more than a discrete VRAM label.
 
+### Implementation findings (whisper-rs 0.16.0, whisper.cpp 1.8.3)
+
+Measured 2026-10-09 while implementing Phase 7.
+
+- **Nix strips `-march=native`.** ggml defaults to `GGML_NATIVE=ON`, but the Nix
+  cc-wrapper (`NIX_ENFORCE_NO_NATIVE`) removes the flag, yielding a build with
+  no SIMD at all (`print_system_info` lists only `REPACK`): base-q5_1 ran at
+  RTF 1.49. Setting `GGML_NATIVE=OFF` + `GGML_AVX/AVX2/FMA/F16C/BMI2=ON`
+  (x86-64-v3; whisper-rs-sys forwards `GGML_*` env vars to CMake) gives RTF 0.13.
+  A future Nix package must set these flags explicitly too. aarch64 is untuned.
+- **`set_abort_callback_safe` is unsound in whisper-rs 0.16.0.** It registers
+  `trampoline::<F>` but passes a `Box<dyn FnMut>` as user data, so a plain
+  closure reads foreign memory and aborts inference at random (observed:
+  "failed to encode", code -6, with nothing cancelled). Workaround in
+  `transcription/whisper.rs`: pass `F = Box<dyn FnMut() -> bool>`, which makes
+  the cast correct. Worth reporting upstream.
+- **Abort granularity.** whisper.cpp polls the abort callback only after each
+  encoder/decoder graph run, not inside one. We also install an
+  `encoder_begin_callback`. Cancel latency is therefore ≤ one encoder pass
+  (≈ 2 s for base on 2 CPU threads; far less on GPU).
+- **`whisper_rs::vulkan::list_devices()` aborts the process without a Vulkan
+  driver** (C++ exception crossing into Rust). The generic ggml backend
+  registry (`ggml_backend_dev_*`, via whisper-rs `raw-api`) catches Vulkan init
+  failures; we enumerate GPUs there, mirroring whisper.cpp's `gpu_device`
+  indexing, and use `ggml_backend_dev_memory` for VRAM numbers.
+- **whisper.cpp silently uses the CPU when no GPU is found**; we check first.
+- **Language detection costs one extra encoder pass**, both whisper.cpp's own
+  `auto` and our restricted `languages = ["de", "en"]` (same cost, plus a mel
+  computation). A fixed language halves encoder time (base: 0.57 s vs 1.1 s on a
+  7 s clip) but a *wrong* fixed language makes Whisper translate.
+- Whisper always encodes a full 30 s window, so short clips cost about as much
+  as 30 s ones; latency is dominated by the encoder on CPU.
+
+CPU benchmark — Ryzen 9 7900X, 8 threads, x86-64-v3 build, 7 s German clip,
+restricted de/en detection (2 encoder passes), greedy:
+
+| Model | Load | Latency | RTF | Peak RSS | Beam 5 latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| base-q5_1 | 50 ms | 0.94 s | 0.13 | 174 MiB | 1.0 s |
+| small-q5_1 | 120 ms | 3.2 s | 0.45 | 368 MiB | 3.3 s |
+| large-v3-turbo-q5_0 | 250 ms | 16.2 s | 2.30 | 746 MiB | 16.7 s |
+
+All three transcribed the clip correctly. Conclusion: large-v3-turbo needs a
+GPU; CPU-only hosts should use small (or base). Vulkan numbers for the RX 7900 XT
+still need to be measured with `wayland-wispr bench --device gpu`.
+
 ### Sources
 
 - [whisper-rs maintained repository](https://codeberg.org/tazz4843/whisper-rs)

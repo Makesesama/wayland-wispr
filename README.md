@@ -4,12 +4,12 @@ A planned Wayland dictation overlay: record speech, transcribe locally or throug
 an OpenAI-compatible API, optionally polish with an LLM, then insert the result
 into the active application.
 
-**Status:** early but usable end to end except transcription. The resident
+**Status:** usable end to end with local transcription. The resident
 process, layer-shell overlay, control socket, session state machine, Wayland
-capability probe, microphone capture (native PipeWire, ALSA fallback), and native
-clipboard/paste insertion work. Transcription and cleanup are **not implemented
-yet** — a recording produces a placeholder transcript stating its duration
-(or `debug.fake_transcript`). No Nix app package yet.
+capability probe, microphone capture (native PipeWire, ALSA fallback), local
+whisper.cpp transcription (CPU or Vulkan GPU), and native clipboard/paste
+insertion work. LLM cleanup and the remote API backend are **not implemented
+yet**. No Nix app package yet.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the proposed design, backend choices,
 Wayland constraints, and phased implementation checklist with acceptance criteria.
@@ -30,6 +30,7 @@ wayland-wispr status          # JSON state (never contains transcript text)
 wayland-wispr devices         # list microphones of the audio host
 wayland-wispr copy            # put the ready result on the clipboard
 wayland-wispr insert          # copy, then send the paste chord to the focused app
+wayland-wispr bench <wav>     # measure the configured whisper model on this machine
 ```
 
 The control socket is `$XDG_RUNTIME_DIR/wayland-wispr/control.sock` (private
@@ -47,7 +48,45 @@ Optional settings: `$XDG_CONFIG_HOME/wayland-wispr/config.toml`, see
 | `src/probe.rs` | Native `wayland-client` global probe on its own connection |
 | `src/audio/` | `cpal` capture thread (lock-free `rtrb` ring from the realtime callback), downmix, `rubato` resampling to 16 kHz mono, silence/length checks, `hound` WAV |
 | `src/injection/` | Data-control clipboard (`wl-clipboard-rs`), XKB keymap/chord planning (`xkbcommon`), `zwp_virtual_keyboard_v1` paste chord (`wayland-protocols-misc`) |
+| `src/transcription/` | Backend interface + cancellation; `whisper.rs`: whisper.cpp worker thread (lazy load, preload on record, idle unload, de/en-restricted language detection); `model.rs`: model resolution/validation |
+| `src/bench.rs` | `bench` subcommand: load time, latency, RSS and VRAM per model/device |
 | `src/config.rs` | TOML settings with validation |
+
+## Local transcription (whisper)
+
+Models are whisper.cpp ggml files, looked up as
+`$XDG_DATA_HOME/wayland-wispr/models/ggml-<model>.bin` (or `models_dir` /
+`model_path`). The app never downloads anything; fetch models yourself:
+
+```sh
+mkdir -p ~/.local/share/wayland-wispr/models && cd $_
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+```
+
+Small vs. large is a per-machine config choice, not a different code path:
+
+| Machine | Suggested | Notes |
+| --- | --- | --- |
+| Discrete GPU (e.g. RX 7900 XT) | `large-v3-turbo-q5_0`, `device = "gpu"`, `beam_size = 5` | build with `--features whisper-vulkan` |
+| CPU only / little VRAM | `small-q5_1` or `base-q5_1`, `device = "cpu"` | |
+
+Use multilingual models (not `.en`) for German. `languages = ["de", "en"]`
+restricts auto-detection; a *fixed* `language` that doesn't match the speech
+makes Whisper translate. `keep_loaded = "idle"` frees (V)RAM after
+`idle_unload_secs` (e.g. for a local LLM or games); `preload` loads the model
+while you are still speaking. GPU mode never silently falls back to CPU: a
+missing GPU or out-of-memory is an error suggesting a smaller model or CPU.
+
+Measure before choosing (prints the transcript to stdout):
+
+```sh
+cargo run --release --features whisper-vulkan -- bench dev/recordings/<file>.wav --device gpu
+cargo run --release -- bench dev/recordings/<file>.wav --model small-q5_1 --device cpu
+```
+
+`cancel` stops inference at the next whisper.cpp graph boundary; a running
+encoder pass (≈ one 30 s window) cannot be interrupted, so cancelling a long CPU
+transcription can take a moment.
 
 **Insertion notes.** `copy` and `insert` replace your clipboard (no restoration).
 `insert` targets whatever is focused *when it runs* and reports success once the
@@ -73,7 +112,12 @@ The flake pins nixpkgs in `flake.lock` and provides development shells for
 - PipeWire and ALSA libraries for CPAL microphone capture. `audio.host = "auto"`
   uses the native PipeWire host when its socket is reachable and logs why it
   fell back to ALSA otherwise.
-- CMake, Ninja, Clang, and libclang for CPU-only `whisper-rs` builds and bindgen.
+- CMake, Ninja, Clang, and libclang for `whisper-rs` builds and bindgen, plus
+  Vulkan headers/loader and `glslc` for `--features whisper-vulkan`. On x86_64
+  the shell sets `GGML_AVX2` & co.: Nix's compiler wrapper strips
+  `-march=native`, which would otherwise build whisper.cpp without SIMD
+  (~10x slower). After changing `GGML_*` variables run
+  `cargo clean -p whisper-rs-sys`.
 - OpenSSL for HTTP clients using native TLS; `reqwest` with rustls is also an option.
 - Wayland/xkbcommon libraries and `wayland-info` for protocol inspection.
   Clipboard/input will use native Rust libraries, not subprocess tools.
@@ -92,7 +136,7 @@ cargo run -- run
 
 # terminal 2: drive it (or bind these in fenster to the absolute
 # path of target/debug/wayland-wispr)
-cargo run -q -- toggle      # start; toggle again to stop → Ready after fake_processing_ms
+cargo run -q -- toggle      # start; toggle again to stop → transcribes → Ready
 cargo run -q -- status
 cargo run -q -- insert      # focus your target window first, or use a keybinding
 cargo run -q -- copy
@@ -103,8 +147,14 @@ The dev config saves every normalized recording (16 kHz mono WAV, private
 permissions) to `dev/recordings/` (gitignored) so you can listen to what a model
 would receive, e.g. `pw-play dev/recordings/<file>.wav`. Recordings shorter than
 `audio.min_seconds` or quieter than `audio.silence_threshold_dbfs` end in an
-error instead of a result. Uncomment `debug.fake_transcript` to paste fixed test
-text (Unicode, emoji, newline, tab) instead of the duration placeholder.
+error instead of a result. Set `transcription.backend = "fake"` (and optionally
+`debug.fake_transcript`) to test the UI/insertion without a model.
+
+The dev config expects `dev/models/ggml-large-v3-turbo-q5_0.bin` on the GPU, so
+run the resident process with `cargo run --features whisper-vulkan -- run`
+(client commands work from either build). `cargo test` needs no model;
+`WAYLAND_WISPR_TEST_MODEL=dev/models/ggml-base-q5_1.bin cargo test` adds a
+real-model cancellation test.
 Outside the dev config, recordings are never written to disk.
 Config changes require restarting `run`; client commands don't read the config.
 
@@ -125,7 +175,8 @@ wayland-info | grep -E 'layer_shell|virtual_keyboard|data_control'
 The dev shell does not enable host services, change input permissions, install
 models, or configure API keys. Keep credentials out of Nix files and Git; use
 runtime environment variables or a user-local secret store. Local Whisper model
-files should live outside the repository. GPU acceleration is not configured.
+files live outside the repository (or in gitignored `dev/models/`). The GPU
+build needs a host Vulkan driver (RADV on NixOS via `hardware.graphics`).
 
 ## Suggested implementation
 

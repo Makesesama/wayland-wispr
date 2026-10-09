@@ -81,6 +81,9 @@ pub enum Effect {
     ScheduleRecordingLimit { session: SessionId },
     /// Stop recording and process the captured audio of a session.
     StartProcessing { session: SessionId },
+    /// Stop processing a session (e.g. abort native inference). Its result,
+    /// if one still arrives, is ignored.
+    AbortProcessing { session: SessionId },
     /// Copy or insert a ready result. Must be followed by exactly one
     /// [`Internal::InjectionFinished`]; it is never retried automatically.
     Inject {
@@ -214,9 +217,14 @@ impl Controller {
 
             (Command::Cancel, State::Idle) => Ok(Some("nothing to cancel")),
             (Command::Cancel, state) => {
-                if let State::Recording { session } = state {
-                    out.effects
-                        .push(Effect::DiscardCapture { session: *session });
+                match state {
+                    State::Recording { session } => out
+                        .effects
+                        .push(Effect::DiscardCapture { session: *session }),
+                    State::Processing { session } => out
+                        .effects
+                        .push(Effect::AbortProcessing { session: *session }),
+                    _ => {}
                 }
                 self.set(State::Idle, &mut out);
                 Ok(Some("cancelled"))
@@ -488,9 +496,15 @@ mod tests {
         assert!(r.ok);
         assert_eq!(o.effects, vec![Effect::DiscardCapture { session: 1 }]);
 
-        // Cancelling while processing has no capture left to discard.
+        // Cancelling while processing aborts the transcription instead.
         run(&mut c, Command::Start);
         run(&mut c, Command::Stop);
+        let (_, o) = run(&mut c, Command::Cancel);
+        assert_eq!(o.effects, vec![Effect::AbortProcessing { session: 2 }]);
+        assert_eq!(kind(&c), StateKind::Idle);
+
+        // Cancelling a ready result has nothing to stop.
+        ready(&mut c, "x");
         let (_, o) = run(&mut c, Command::Cancel);
         assert!(o.effects.is_empty());
     }

@@ -1,10 +1,13 @@
 mod app;
 mod audio;
+#[cfg(feature = "local-whisper")]
+mod bench;
 mod config;
 mod controller;
 mod injection;
 mod ipc;
 mod probe;
+mod transcription;
 mod ui;
 
 use std::path::PathBuf;
@@ -13,7 +16,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use crate::config::{Config, WhisperDevice};
 use crate::controller::Command;
 
 /// Wayland-native dictation overlay.
@@ -59,17 +62,47 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Measure the configured local whisper model on a WAV file: load time,
+    /// latency, RAM and VRAM use. Prints the transcript to stdout.
+    Bench {
+        /// Any PCM WAV file (e.g. from debug.save_recordings_dir).
+        wav: PathBuf,
+        /// Number of transcription runs after loading.
+        #[arg(long, default_value_t = 3)]
+        runs: u32,
+        /// Override transcription.whisper.model (a name such as `small-q5_1`).
+        #[arg(long)]
+        model: Option<String>,
+        /// Override the model with an explicit file.
+        #[arg(long, conflicts_with = "model")]
+        model_path: Option<PathBuf>,
+        /// Override transcription.whisper.device.
+        #[arg(long, value_parser = ["cpu", "gpu"])]
+        device: Option<String>,
+        /// Override transcription.whisper.beam_size.
+        #[arg(long)]
+        beam_size: Option<u8>,
+        /// Override the language (code or `auto`; clears `languages`).
+        #[arg(long)]
+        language: Option<String>,
+        /// Override the CPU thread count.
+        #[arg(long)]
+        threads: Option<u16>,
+    },
 }
 
 fn main() -> ExitCode {
+    let cli = Cli::parse();
+    // whisper.cpp logs every buffer allocation at info level; keep that
+    // available via RUST_LOG=whisper_rs=info but quiet by default.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,whisper_rs=warn")),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -87,6 +120,46 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Probe { json } => return probe(json),
+        Cmd::Bench {
+            wav,
+            runs,
+            model,
+            model_path,
+            device,
+            beam_size,
+            language,
+            threads,
+        } => {
+            let config = Config::load(cli.config.as_deref())?;
+            let device = device.map(|d| match d.as_str() {
+                "gpu" => WhisperDevice::Gpu,
+                _ => WhisperDevice::Cpu,
+            });
+            #[cfg(feature = "local-whisper")]
+            {
+                bench::run(
+                    &config.transcription.whisper,
+                    &wav,
+                    runs,
+                    bench::Overrides {
+                        model,
+                        model_path,
+                        device,
+                        beam_size,
+                        language,
+                        threads,
+                    },
+                )?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            #[cfg(not(feature = "local-whisper"))]
+            {
+                let _ = (
+                    config, wav, runs, model, model_path, device, beam_size, language, threads,
+                );
+                anyhow::bail!("this build lacks the `local-whisper` feature");
+            }
+        }
         Cmd::Devices { json } => {
             let config = Config::load(cli.config.as_deref())?;
             return devices(&config, json);

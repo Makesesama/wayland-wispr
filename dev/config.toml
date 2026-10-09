@@ -15,6 +15,22 @@ host = "auto"                   # PipeWire if available, else ALSA; or "pipewire
 min_seconds = 0.3
 silence_threshold_dbfs = -50.0
 
+[transcription]
+backend = "whisper"             # "fake" skips the model (UI/insertion tests)
+
+[transcription.whisper]
+# Models live in dev/models/ (gitignored); see README for downloads.
+models_dir = "models"
+# RX 7900 XT: run with `cargo run --features whisper-vulkan -- run`.
+# Without the GPU build use device = "cpu" and e.g. model = "small-q5_1".
+model = "large-v3-turbo-q5_0"
+device = "gpu"
+language = "auto"
+languages = ["de", "en"]
+beam_size = 5
+keep_loaded = "idle"
+idle_unload_secs = 300
+
 [injection]
 paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
 pre_insert_delay_ms = 150
@@ -25,6 +41,6 @@ fake_processing_ms = 500
 # Normalized 16 kHz mono WAVs of every recording go to dev/recordings/
 # (gitignored, private permissions). Listen with e.g. `pw-play <file>`.
 save_recordings_dir = "recordings"
-# Uncomment to paste fixed test text instead of the placeholder that reports
-# the recorded duration (exercises Unicode, emoji, multiline, tab insertion).
+# With transcription.backend = "fake": paste fixed test text instead of the
+# placeholder that reports the recorded duration (Unicode, emoji, multiline, tab).
 # fake_transcript = "Grüße aus wayland-wispr, 世界 👋\nzweite Zeile\tmit Tab"

@@ -13,12 +13,32 @@ host = "auto"                  # PipeWire if available, else ALSA; or "pipewire"
 min_seconds = 0.3              # shorter recordings are rejected
 silence_threshold_dbfs = -50.0 # quieter recordings are rejected as "no speech"
 
+[transcription]
+backend = "whisper"            # local whisper.cpp; "fake" = placeholder text (UI/insert tests)
+
+[transcription.whisper]
+model = "base-q5_1"            # → $XDG_DATA_HOME/wayland-wispr/models/ggml-<model>.bin
+# models_dir = "/path"         # relative paths are relative to this file
+# model_path = "/path/ggml-large-v3-turbo-q5_0.bin"  # explicit file, overrides model
+device = "cpu"                 # "gpu" needs a build with `--features whisper-vulkan`
+# gpu_device = 0               # index as listed by `wayland-wispr bench`
+flash_attn = true
+# threads = 8                  # default: available cores, at most 8
+language = "auto"             # or a fixed code like "de"; a fixed language that
+                               # doesn't match the speech gets *translated* into it
+languages = ["de", "en"]       # with "auto": only choose among these ([] = any)
+# initial_prompt = "Names: makussu, riverfx, fenster."  # vocabulary hints
+beam_size = 1                  # 1 = greedy (fast); 5 = beam search (better, slower)
+keep_loaded = "idle"           # "always" | "idle" | "never" (unload after each use)
+idle_unload_secs = 300         # with "idle": free (V)RAM after this long unused
+preload = true                 # start loading the model when recording starts
+
 [injection]
 paste_chord = "ctrl+v"     # terminals: "ctrl+shift+v" or "shift+Insert"
 pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert
 key_delay_ms = 10
 
 [debug]
-fake_processing_ms = 1500  # placeholder processing delay until real backends exist
+fake_processing_ms = 1500  # duration of the "fake" transcription backend
 # save_recordings_dir = "/path"  # debug only: save every recording as WAV
-# fake_transcript = "Grüße, 世界 👋\nsecond line"  # test text for copy/insert
+# fake_transcript = "Grüße, 世界 👋\nsecond line"  # "fake" backend text for copy/insert tests
