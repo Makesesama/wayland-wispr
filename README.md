@@ -103,7 +103,7 @@ punctuation, turns spoken "new line"/"neuer Absatz"/"Komma" into formatting,
 and writes enumerations as lists. It is on by default and points at Ollama:
 
 ```sh
-ollama serve                      # or services.ollama on NixOS
+ollama serve                      # or services.ollama on NixOS, see "Ollama for LLM cleanup"
 ollama pull qwen2.5:7b-instruct   # the default cleanup.model
 ```
 
@@ -206,6 +206,56 @@ services.wayland-wispr = {
   The module does not run Ollama; use `services.ollama` on the system.
 - Bind `wayland-wispr toggle`, `insert`, and `cancel` in the WM. The package is
   added to `home.packages`.
+
+### Ollama for LLM cleanup
+
+Cleanup needs an OpenAI-compatible server, and the home-manager module does not
+start one. Use the NixOS `services.ollama` module. Unlike the home-manager
+module of the same name, it can pull models declaratively. It goes in the
+**system** configuration:
+
+```nix
+# NixOS configuration
+services.ollama = {
+  enable = true;
+  # GPU backend: ollama-vulkan (most GPUs), ollama-rocm (AMD), ollama-cuda
+  # (NVIDIA), ollama-cpu. The plain `ollama` package is CPU-only unless
+  # nixpkgs.config.rocmSupport/cudaSupport is set.
+  package = pkgs.ollama-vulkan;
+  # Pulled by ollama-model-loader.service after ollama starts; must match
+  # services.wayland-wispr.settings.cleanup.model.
+  loadModels = [ "qwen2.5:7b-instruct" ];
+  # host = "127.0.0.1"; port = 11434;  # defaults, matching cleanup.base_url
+  # environmentVariables.OLLAMA_KEEP_ALIVE = "30m";  # default unloads after 5 min
+};
+hardware.graphics.enable = true; # Vulkan driver, also for wayland-wispr-vulkan
+```
+
+```nix
+# home-manager: the defaults already point at this server
+services.wayland-wispr.settings.cleanup = {
+  base_url = "http://127.0.0.1:11434/v1"; # default
+  model = "qwen2.5:7b-instruct";          # default
+  # reasoning_effort = "none";            # for thinking models such as Qwen3.x
+};
+```
+
+Notes:
+
+- The first rebuild pulls the model in the background. Check progress with
+  `journalctl -u ollama-model-loader`. Until the pull finishes, cleanup fails
+  and the raw transcript is used. Check the result with
+  `wayland-wispr cleanup "ähm also das ist, äh, ein Test"`.
+- `wayland-wispr.service` is a user unit and cannot be ordered after the system
+  `ollama.service`. No ordering is needed: requests are made per dictation, and
+  `cleanup.preload` loads the model while you speak.
+- Whisper and the LLM share VRAM when both run on the GPU. Check `ollama ps`
+  for `100% GPU`; see the notes under [LLM cleanup](#llm-cleanup) for sizing.
+- Ollama listens on loopback by default. Keep it that way: setting `host` to
+  `0.0.0.0` exposes an unauthenticated API to the network. Only set
+  `openFirewall` if that is intended.
+- On machines without a usable GPU, choose a small model (e.g.
+  `qwen2.5:3b-instruct`) or set `cleanup.enabled = false`.
 
 ## Development
 
