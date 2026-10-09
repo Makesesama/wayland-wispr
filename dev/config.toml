@@ -59,6 +59,12 @@ paste_chord = "ctrl+v"     # method = "paste" only; terminals: "ctrl+shift+v"
 pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert
 key_delay_ms = 10
 
+[note]
+# `cargo run -- note`: record, then append the result to dev/notes.md
+# (gitignored) via dev/note-hook.sh instead of typing it.
+hook = "note-hook.sh"
+timeout_secs = 10
+
 [debug]
 fake_processing_ms = 500
 # Normalized 16 kHz mono WAVs of every recording go to dev/recordings/

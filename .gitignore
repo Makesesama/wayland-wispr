@@ -6,3 +6,4 @@
 .env.*
 /dev/recordings/
 /dev/models/
+/dev/notes.md
