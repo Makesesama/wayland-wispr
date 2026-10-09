@@ -36,15 +36,17 @@ keep_loaded = "idle"
 idle_unload_secs = 300
 
 [cleanup]
-# Needs `ollama serve` and `ollama pull qwen2.5:7b-instruct`; without it the
-# raw transcript is used. Compare models/prompts with
+# Needs `ollama serve` and `ollama pull gemma4:12b`; without it the raw
+# transcript is used. Compare models/prompts with
 # `cargo run -- cleanup-eval dev/cleanup-fixtures.toml --model <name>`.
 enabled = true
 base_url = "http://127.0.0.1:11434/v1"
-model = "mistral-nemo"
+# gemma4:12b (thinking off): 15/16 on the fixtures, median ~1.5 s here
+# (mistral-nemo: 11/16, gemma3:12b: 14/16).
+model = "gemma4:12b"
+reasoning_effort = "none"
 # Qwen3.8-27B on the 16 GiB card next to Whisper: a ~3-bit quant, thinking off.
 # model = "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS"
-# reasoning_effort = "none"
 
 [injection]
 # When a result is ready: "insert" (copy + type into the focused field),
