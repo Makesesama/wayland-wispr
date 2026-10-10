@@ -31,6 +31,7 @@ window.wispr { padding: 16px; }
 .processing .dot { background-color: #c98a00; }
 .ready .dot { background-color: #1e9e5a; }
 .error .dot { background-color: #e0561b; }
+.waiting .dot { background-color: #c98a00; }
 .note.recording .dot { background-color: #1f6fd1; }
 
 .step.pending { background-color: rgba(0, 0, 0, 0.15); }

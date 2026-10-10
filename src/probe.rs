@@ -10,6 +10,7 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 
 pub const LAYER_SHELL: &str = "zwlr_layer_shell_v1";
 pub const VIRTUAL_KEYBOARD: &str = "zwp_virtual_keyboard_manager_v1";
+pub const INPUT_METHOD: &str = "zwp_input_method_manager_v2";
 pub const EXT_DATA_CONTROL: &str = "ext_data_control_manager_v1";
 pub const WLR_DATA_CONTROL: &str = "zwlr_data_control_manager_v1";
 pub const SEAT: &str = "wl_seat";
@@ -27,6 +28,7 @@ pub struct Capabilities {
     /// Advertised version of each protocol, or `None` if missing.
     pub layer_shell: Option<u32>,
     pub virtual_keyboard: Option<u32>,
+    pub input_method: Option<u32>,
     pub ext_data_control: Option<u32>,
     pub wlr_data_control: Option<u32>,
     pub seats: usize,
@@ -37,14 +39,20 @@ impl Capabilities {
         self.ext_data_control.is_some() || self.wlr_data_control.is_some()
     }
 
+    /// Text can be committed as the seat's input method.
+    pub fn can_commit(&self) -> bool {
+        self.input_method.is_some() && self.seats > 0
+    }
+
     /// Native clipboard + virtual-keyboard paste is possible.
     pub fn can_insert(&self) -> bool {
         self.data_control() && self.virtual_keyboard.is_some() && self.seats > 0
     }
 
-    pub fn rows(&self) -> [(&'static str, Option<u32>); 4] {
+    pub fn rows(&self) -> [(&'static str, Option<u32>); 5] {
         [
             (LAYER_SHELL, self.layer_shell),
+            (INPUT_METHOD, self.input_method),
             (VIRTUAL_KEYBOARD, self.virtual_keyboard),
             (EXT_DATA_CONTROL, self.ext_data_control),
             (WLR_DATA_CONTROL, self.wlr_data_control),
@@ -80,6 +88,7 @@ pub fn probe() -> Result<Capabilities, ProbeError> {
         Capabilities {
             layer_shell: version(LAYER_SHELL),
             virtual_keyboard: version(VIRTUAL_KEYBOARD),
+            input_method: version(INPUT_METHOD),
             ext_data_control: version(EXT_DATA_CONTROL),
             wlr_data_control: version(WLR_DATA_CONTROL),
             seats: list.iter().filter(|g| g.interface == SEAT).count(),

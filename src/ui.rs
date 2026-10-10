@@ -12,7 +12,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::cleanup::CleanupStatus;
 use crate::config::{Config, InsertMethod, OnReady, OverlayConfig, OverlayLayer, Side};
-use crate::controller::{Action, Notice, SessionId, State};
+use crate::controller::{Action, FailureKind, Notice, SessionId, State};
 use crate::theme;
 
 const APP_ID: &str = "de.makussu.WaylandWispr";
@@ -33,6 +33,8 @@ const WAVE_FLOOR_DBFS: f32 = -60.0;
 const FADE: Duration = Duration::from_millis(160);
 /// How long "Inserted"/"Copied" stays up after a successful insert or copy.
 const CONFIRM: Duration = Duration::from_millis(900);
+/// Length of the `.attention` pulse (see the stylesheet).
+const ATTENTION: Duration = Duration::from_millis(700);
 
 /// Built-in stylesheet (the default theme) with all sizes multiplied by
 /// `scale` and the pill background at `opacity`. A custom `overlay.theme` is
@@ -64,6 +66,14 @@ window.wispr {{
 .processing .dot {{ background-color: #f5c542; }}
 .ready .dot {{ background-color: #4dd28a; }}
 .error .dot {{ background-color: #ff7a45; }}
+/* Inserted nowhere (no text field focused); waiting for another try. */
+.waiting .dot {{ background-color: #f5c542; }}
+/* Pulsed when a retry still finds no text field. */
+.attention {{ animation: attention 350ms ease-in-out 2 alternate; }}
+@keyframes attention {{
+  from {{ opacity: 1; }}
+  to {{ opacity: 0.4; }}
+}}
 /* `wayland-wispr note` sessions also carry `.note`. */
 .note.recording .dot {{ background-color: #4da3ff; }}
 /* Step indicator: one segment per step (transcribe, polish, insert/copy). */
@@ -394,6 +404,8 @@ struct Overlay {
     fade: RefCell<Option<gtk4::TickCallbackId>>,
     /// Pending timeout that ends the insert confirmation.
     confirm: RefCell<Option<glib::SourceId>>,
+    /// Pending timeout that ends the `.attention` pulse.
+    attention: RefCell<Option<glib::SourceId>>,
     recording_since: Cell<Option<Instant>>,
     recording_session: Cell<Option<SessionId>>,
     processing_session: Cell<Option<SessionId>>,
@@ -428,6 +440,7 @@ impl Overlay {
 
         let scale = config.overlay.scale;
         let insert_label = match config.injection.method {
+            InsertMethod::InputMethod => "Inserting…",
             InsertMethod::Type => "Typing…",
             InsertMethod::Paste => "Pasting…",
         };
@@ -551,6 +564,7 @@ impl Overlay {
             last: RefCell::new(View::Hidden),
             fade: RefCell::new(None),
             confirm: RefCell::new(None),
+            attention: RefCell::new(None),
             recording_since: Cell::new(None),
             recording_session: Cell::new(None),
             processing_session: Cell::new(None),
@@ -567,7 +581,14 @@ impl Overlay {
             id.remove();
         }
         let previous = self.last.replace(view.clone());
-        for class in ["recording", "processing", "ready", "error", "note"] {
+        for class in [
+            "recording",
+            "processing",
+            "ready",
+            "error",
+            "waiting",
+            "note",
+        ] {
             self.pill.remove_css_class(class);
         }
         if view.is_note() {
@@ -645,6 +666,25 @@ impl Overlay {
                 ("processing", Stage::Transcribing.label(), String::new())
             }
             View::Ready {
+                notice:
+                    Some(Notice {
+                        action: Action::Insert,
+                        failure,
+                        ..
+                    }),
+                ..
+            } if failure.kind == FailureKind::NoTextField => {
+                // A retry that still found no text field: draw the eye.
+                if matches!(previous, View::Inserting { .. }) {
+                    self.pulse();
+                }
+                (
+                    "waiting",
+                    "No text field focused",
+                    "Copied. Focus a text field and press the dictation key to insert it, or cancel.".to_owned(),
+                )
+            }
+            View::Ready {
                 notice: Some(notice),
                 ..
             } => {
@@ -686,6 +726,23 @@ impl Overlay {
         self.detail.set_text(&detail);
         self.detail.set_visible(!detail.is_empty());
         self.fade_in();
+    }
+
+    /// Briefly pulse the pill (`.attention`).
+    fn pulse(&self) {
+        if let Some(id) = self.attention.take() {
+            id.remove();
+        }
+        // Re-adding the class restarts the animation only after a style
+        // update without it; the timeout below provides that gap.
+        self.pill.add_css_class("attention");
+        let overlay = self.weak_self();
+        *self.attention.borrow_mut() = Some(glib::timeout_add_local_once(ATTENTION, move || {
+            if let Some(overlay) = overlay.upgrade() {
+                overlay.attention.take();
+                overlay.pill.remove_css_class("attention");
+            }
+        }));
     }
 
     fn fade_in(&self) {

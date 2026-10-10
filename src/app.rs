@@ -269,7 +269,7 @@ impl Runtime {
                 self.spawn("deliver", move || {
                     let result = match action {
                         Action::Copy => injector.copy(&text).map_err(Into::into),
-                        Action::Insert => injector.insert(&text).map_err(Into::into),
+                        Action::Insert => injector.insert(&text),
                         // The controller only accepts `note` with a hook.
                         Action::Note => match note_hook {
                             Some(hook) => hook.run(session, &text, &cancel),

@@ -39,7 +39,7 @@ compatible. Keep transcription, cleanup, and insertion independently configurabl
 | Local transcription | `whisper-rs` 0.16 (whisper.cpp 1.8.3), default feature `local-whisper` | CPU by default; `whisper-vulkan` feature for GPUs. Same code path for small and large models: model, device, and lifetime are per-host config. Quantized models supplied separately. See RESEARCH.md §2 for measurements and pitfalls. |
 | Cleanup | OpenAI-compatible chat completions against a server the user runs (default: Ollama on `127.0.0.1:11434`) | Supports remote providers and local servers exposing the same API. In-process inference is ruled out for now: `llama-cpp-2` and `whisper-rs` both bundle ggml and fail to link together (llama.cpp#9267). The app does not start or manage the server. |
 | Clipboard | Native `wl-clipboard-rs`; `arboard` is an alternative | Focus-free Wayland data-control. Arboard requires `wayland-data-control` and can fall back to X11; prefer direct protocol library for strict Wayland-only behavior. Neither executes `wl-copy`. |
-| Input | Native `wayland-client` + `wayland-protocols-misc` | Use `zwp_virtual_keyboard_v1` for paste chords; research direct typing in a bounded spike. No `wtype`/uinput backend. |
+| Input | Native `wayland-client` + `wayland-protocols-misc` | Default: commit text as the seat's `zwp_input_method_v2`. Alternatives: `zwp_virtual_keyboard_v1` typing or paste chords. No `wtype`/uinput backend. |
 | Configuration | TOML + `serde` | Typed, human-readable settings under the XDG config directory. |
 | CLI / logging / errors | `clap`, `tracing`, `thiserror` | Small control interface, structured non-sensitive diagnostics, actionable errors. |
 
@@ -202,7 +202,8 @@ injection are separate capabilities; neither implies the other.
 
 | Backend | Behavior | Limits / decision |
 | --- | --- | --- |
-| Native clipboard + virtual-keyboard paste | Set text through data-control, then emit a native paste chord | Recommended first insertion path. Unicode-friendly; requires data-control, virtual-keyboard support, and the target's paste chord. |
+| Input method (`zwp_input_method_v2`, default) | Commit the text to the focused `zwp_text_input_v3` | No keys, no clipboard, and only when a text field is active. Requires text-input-v3 in the target (Chromium/Electron only with flags) and excludes other IMEs on the seat. |
+| Native clipboard + virtual-keyboard paste | Set text through data-control, then emit a native paste chord | First insertion path implemented. Unicode-friendly; requires data-control, virtual-keyboard support, and the target's paste chord. |
 | Native clipboard only | Explicit copy action; user pastes | Available as a user action, not a subprocess fallback. |
 | Direct virtual-keyboard typing | Upload an XKB keymap and send key events through Rust bindings | Avoids replacing clipboard; keycode/Unicode/toolkit behavior must pass a native spike before adoption. |
 
@@ -224,6 +225,24 @@ data-control. `arboard` with `wayland-data-control` uses this library underneath
 but may silently fall back to X11. Ordinary GDK clipboard operations are not a
 reliable background-control interface for a never-focused overlay: core selection
 access is focus/input-serial constrained. Probe advertised data-control globals.
+
+**Input method:** a dedicated thread binds `zwp_input_method_v2` on its own
+connection at startup and keeps it for the process lifetime: river and sway
+send text-input `enter` only while an input method exists. It tracks
+`activate`/`deactivate` (applied on `done`) and the `done` count, which every
+`commit` must carry as its serial (wlroots silently drops stale commits).
+Insertion requests reach the thread over a channel plus a wake socket; it
+roundtrips first to catch up on activation, then sends `commit_string` +
+`commit` in chunks of at most 3900 bytes (Wayland's 4096-byte message limit),
+letting the client's `done` settle between chunks and aborting if the field
+deactivates mid-way. Without an active field the text is copied and the
+failure (`FailureKind::NoTextField`) returns the result to Ready, where
+`toggle` retries the insert. `unavailable` (another IME owns the seat) is
+reported likewise; the next attempt requests the input method again. Verified
+end to end on headless sway with foot (commit, no field, re-focus, 10 KB
+chunked, second instance unavailable then re-acquired). river couples
+text-input focus to keyboard focus (`Seat.focus` → `InputRelay.focus`);
+sway does not reset it when an empty workspace is focused.
 
 **Native keyboard:** bind the selected seat and virtual-keyboard manager on a
 separate Wayland connection/event queue; do not take over GTK's connection.
@@ -397,7 +416,10 @@ assumptions before investing in inference. All unchecked items are future work.
             balanced Ctrl+V with modifiers cleared).
       - [ ] Manual riverfx test: editor, browser, terminal (`ctrl+shift+v`),
             physical keyboard/modifiers afterwards.
-      - [x] Direct Unicode typing (`injection.method = "type"`, default):
+      - [x] Input-method insertion (`injection.method = "input_method"`,
+            default): commit to the focused text-input-v3 field; copy and
+            wait for `toggle` without one. Needs a manual riverfx check.
+      - [x] Direct Unicode typing (`injection.method = "type"`):
             per-text keymaps on 48 printable evdev positions (wtype#77),
             batched keymap switches, Shift+Return newlines; auto-insert after
             processing via `injection.on_ready`. Needs a manual riverfx check.

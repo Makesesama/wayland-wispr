@@ -355,9 +355,14 @@ fn probe(json: bool) -> anyhow::Result<ExitCode> {
             }
         );
         println!(
-            "insertion: {}",
+            "insertion: input method {}; clipboard + virtual keyboard {}",
+            if caps.can_commit() {
+                "possible"
+            } else {
+                "unavailable (needs input-method-v2 and a seat)"
+            },
             if caps.can_insert() {
-                "native clipboard + virtual-keyboard paste possible"
+                "possible"
             } else {
                 "unavailable (needs data-control, virtual-keyboard, and a seat)"
             }

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::config::Config;
-use crate::controller::{Failure, SessionId};
+use crate::controller::{Failure, FailureKind, SessionId};
 use crate::transcription::CancelFlag;
 
 /// stderr kept for logging and the error detail; the rest is drained.
@@ -114,6 +114,7 @@ impl NoteHook {
         Err(Failure {
             message,
             detail: last_line(stderr),
+            kind: FailureKind::Failed,
         })
     }
 
@@ -286,6 +287,7 @@ mod tests {
             Failure {
                 message: "note hook exited with status 3".into(),
                 detail: Some("no inbox".into()),
+                kind: FailureKind::Failed,
             }
         );
         let h = hook(dir.path(), "exit 1", 5);

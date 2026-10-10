@@ -16,8 +16,7 @@ pub type SessionId = u64;
 pub enum Action {
     /// Put the result on the clipboard; the user pastes.
     Copy,
-    /// Put the result on the clipboard and type or paste it into the
-    /// focused application.
+    /// Put the result into the focused application.
     Insert,
     /// Pass the result to the user's `note.hook` on stdin.
     Note,
@@ -104,6 +103,16 @@ pub struct Failure {
     /// Written by the note hook (its last stderr line). May contain anything,
     /// including the transcript, so it is only shown in the overlay.
     pub detail: Option<String>,
+    pub kind: FailureKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FailureKind {
+    #[default]
+    Failed,
+    /// Nothing to insert into: no text field was focused. The text was
+    /// copied instead; `toggle`/`insert` try again once one is.
+    NoTextField,
 }
 
 impl From<String> for Failure {
@@ -111,6 +120,7 @@ impl From<String> for Failure {
         Self {
             message,
             detail: None,
+            kind: FailureKind::Failed,
         }
     }
 }
@@ -125,6 +135,8 @@ impl From<&str> for Failure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub action: Action,
+    /// The raw transcript was delivered (`--raw`).
+    pub raw: bool,
     pub failure: Failure,
 }
 
@@ -354,6 +366,24 @@ impl Controller {
             (Command::Toggle | Command::Start | Command::Note, State::Processing { .. }) => {
                 Err("still processing; use `cancel` to discard")
             }
+            // After a failed insertion (typically: no text field was
+            // focused), the dictation key tries again.
+            (
+                Command::Toggle,
+                State::Ready {
+                    notice:
+                        Some(Notice {
+                            action: Action::Insert,
+                            raw,
+                            ..
+                        }),
+                    ..
+                },
+            ) => {
+                let raw = *raw;
+                self.deliver(Action::Insert, raw, &mut out);
+                return (None, out);
+            }
             (Command::Toggle | Command::Start, State::Ready { .. }) => {
                 Err("a result is ready; use `copy`/`insert`, or `cancel` to discard it")
             }
@@ -379,9 +409,7 @@ impl Controller {
                 | Command::CopyRaw
                 | Command::InsertRaw
                 | Command::Note,
-                State::Ready {
-                    session, result, ..
-                },
+                State::Ready { .. },
             ) => {
                 let action = match cmd {
                     Command::Copy | Command::CopyRaw => Action::Copy,
@@ -389,26 +417,7 @@ impl Controller {
                     _ => Action::Insert,
                 };
                 let raw = matches!(cmd, Command::CopyRaw | Command::InsertRaw);
-                let text = if raw {
-                    result.raw_text().to_owned()
-                } else {
-                    result.text.clone()
-                };
-                let (session, result) = (*session, result.clone());
-                out.effects.push(Effect::Deliver {
-                    session,
-                    action,
-                    text,
-                });
-                self.set(
-                    State::Inserting {
-                        session,
-                        result,
-                        action,
-                        raw,
-                    },
-                    &mut out,
-                );
+                self.deliver(action, raw, &mut out);
                 if action != Action::Note {
                     return (None, out);
                 }
@@ -524,7 +533,11 @@ impl Controller {
                             State::Ready {
                                 session,
                                 result: processed,
-                                notice: Some(Notice { action, failure }),
+                                notice: Some(Notice {
+                                    action,
+                                    raw,
+                                    failure,
+                                }),
                             },
                             &mut out,
                         );
@@ -547,6 +560,37 @@ impl Controller {
 
     fn is_recording(&self, session: SessionId) -> bool {
         matches!(self.state, State::Recording { session: s, .. } if s == session)
+    }
+
+    /// Start delivering the ready result. The caller replies (deferred for
+    /// copy/insert).
+    fn deliver(&mut self, action: Action, raw: bool, out: &mut Outcome) {
+        let State::Ready {
+            session, result, ..
+        } = &self.state
+        else {
+            return;
+        };
+        let text = if raw {
+            result.raw_text().to_owned()
+        } else {
+            result.text.clone()
+        };
+        let (session, result) = (*session, result.clone());
+        out.effects.push(Effect::Deliver {
+            session,
+            action,
+            text,
+        });
+        self.set(
+            State::Inserting {
+                session,
+                result,
+                action,
+                raw,
+            },
+            out,
+        );
     }
 
     fn start_recording(&mut self, on_ready: Option<Action>, out: &mut Outcome) {
@@ -842,6 +886,7 @@ mod tests {
                 result: plain("keep me"),
                 notice: Some(Notice {
                     action: Action::Insert,
+                    raw: false,
                     failure: "no virtual keyboard".into()
                 })
             }
@@ -915,6 +960,105 @@ mod tests {
         ready(&mut c, "same");
         let (_, o) = c.handle_command(Command::CopyRaw);
         assert!(matches!(&o.effects[..], [Effect::Deliver { text, .. }] if text == "same"));
+    }
+
+    #[test]
+    fn toggle_retries_insert_without_text_field() {
+        let no_field = || Failure {
+            message: "no text field is focused; copied to the clipboard".into(),
+            detail: None,
+            kind: FailureKind::NoTextField,
+        };
+        let mut c = Controller::with_on_ready(Some(Action::Insert));
+        run(&mut c, Command::Toggle);
+        run(&mut c, Command::Toggle);
+        c.handle_internal(Internal::ProcessingFinished {
+            session: 1,
+            result: Ok(plain("hello")),
+        });
+        c.handle_internal(Internal::DeliveryFinished {
+            session: 1,
+            result: Err(no_field()),
+        });
+        assert_eq!(kind(&c), StateKind::Ready);
+
+        // Still no field: back to Ready, the text is kept.
+        let (reply, o) = c.handle_command(Command::Toggle);
+        assert!(reply.is_none(), "deferred like insert");
+        assert_eq!(
+            o.effects,
+            vec![Effect::Deliver {
+                session: 1,
+                action: Action::Insert,
+                text: "hello".into()
+            }]
+        );
+        let o = c.handle_internal(Internal::DeliveryFinished {
+            session: 1,
+            result: Err(no_field()),
+        });
+        assert!(!o.deferred_reply.unwrap().ok);
+        assert_eq!(kind(&c), StateKind::Ready);
+
+        // A field is focused now.
+        c.handle_command(Command::Toggle);
+        let o = c.handle_internal(Internal::DeliveryFinished {
+            session: 1,
+            result: Ok(()),
+        });
+        assert!(o.deferred_reply.unwrap().ok);
+        assert_eq!(kind(&c), StateKind::Idle);
+        // The next toggle records again.
+        let (_, o) = run(&mut c, Command::Toggle);
+        assert!(o.effects.contains(&Effect::StartCapture { session: 2 }));
+    }
+
+    #[test]
+    fn toggle_retry_keeps_raw_and_cancel_discards() {
+        let mut c = Controller::new();
+        let s = ready(&mut c, "clean");
+        c.handle_command(Command::InsertRaw);
+        c.handle_internal(Internal::DeliveryFinished {
+            session: s,
+            result: Err("no text field".into()),
+        });
+        let (_, o) = c.handle_command(Command::Toggle);
+        assert!(matches!(
+            &o.effects[..],
+            [Effect::Deliver {
+                action: Action::Insert,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            c.state(),
+            State::Inserting {
+                action: Action::Insert,
+                raw: true,
+                ..
+            }
+        ));
+        c.handle_internal(Internal::DeliveryFinished {
+            session: s,
+            result: Err("no text field".into()),
+        });
+        let (reply, _) = run(&mut c, Command::Cancel);
+        assert!(reply.ok);
+        assert_eq!(kind(&c), StateKind::Idle);
+
+        // Only a failed insert is retried by toggle; a plain ready result
+        // or a failed copy still needs an explicit command.
+        let s = ready(&mut c, "x");
+        let (reply, o) = run(&mut c, Command::Toggle);
+        assert!(!reply.ok);
+        assert!(o.effects.is_empty());
+        c.handle_command(Command::Copy);
+        c.handle_internal(Internal::DeliveryFinished {
+            session: s,
+            result: Err("no clipboard".into()),
+        });
+        let (reply, _) = run(&mut c, Command::Toggle);
+        assert!(!reply.ok);
     }
 
     #[test]
@@ -1099,6 +1243,7 @@ mod tests {
             result: Err(Failure {
                 message: "note hook exited with status 1".into(),
                 detail: Some("cannot append secret words".into()),
+                kind: FailureKind::Failed,
             }),
         });
         let reply = o.deferred_reply.unwrap();

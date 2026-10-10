@@ -421,17 +421,18 @@ pub fn is_loopback_host(host: &str) -> bool {
 pub struct InjectionConfig {
     /// What happens automatically once a result is ready.
     pub on_ready: OnReady,
-    /// How `insert` puts the text into the focused application. The text
-    /// is always copied to the clipboard first.
+    /// How `insert` puts the text into the focused application.
     pub method: InsertMethod,
-    /// With `method = "type"`: how line breaks are typed.
+    /// How line breaks are inserted. The input method cannot send
+    /// Shift+Return: there, only `space` differs (from a plain line break).
     pub newline: Newline,
     /// With `method = "type"`: pause after each typed character.
     pub type_delay_ms: u64,
     /// With `method = "paste"`: chord sent after copying, e.g. `ctrl+v`,
     /// `ctrl+shift+v`, `shift+Insert`.
     pub paste_chord: String,
-    /// Delay before typing/pasting, so the triggering keybinding is released.
+    /// Delay before typing/pasting, so the triggering keybinding is released
+    /// (not needed by the input method).
     pub pre_insert_delay_ms: u64,
     /// Delay after keymap changes and while a paste chord is held.
     pub key_delay_ms: u64,
@@ -441,7 +442,7 @@ impl Default for InjectionConfig {
     fn default() -> Self {
         Self {
             on_ready: OnReady::Insert,
-            method: InsertMethod::Type,
+            method: InsertMethod::InputMethod,
             newline: Newline::ShiftEnter,
             type_delay_ms: 2,
             paste_chord: "ctrl+v".into(),
@@ -454,7 +455,7 @@ impl Default for InjectionConfig {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OnReady {
-    /// Copy, then type/paste into whatever is focused when processing ends.
+    /// Insert into whatever is focused when processing ends.
     Insert,
     /// Only copy to the clipboard.
     Copy,
@@ -475,10 +476,16 @@ impl OnReady {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InsertMethod {
-    /// Type the text through the virtual keyboard; works regardless of an
+    /// Commit the text as the seat's input method (`zwp_input_method_v2`)
+    /// to the focused text field (`zwp_text_input_v3`). Sends no keys and
+    /// leaves the clipboard alone; without a focused text field the text is
+    /// copied and kept ready for another `insert`/`toggle`.
+    #[serde(rename = "input_method")]
+    InputMethod,
+    /// Copy, then type the text through the virtual keyboard; works regardless of an
     /// application's paste shortcut.
     Type,
-    /// Send `paste_chord` and let the application paste the clipboard.
+    /// Copy, then send `paste_chord` and let the application paste.
     Paste,
 }
 
@@ -902,6 +909,12 @@ mod tests {
         assert_eq!(c.injection.on_ready.action(), None);
         assert_eq!(c.injection.newline, Newline::Space);
         assert!(toml::from_str::<Config>("[injection]\nmethod = \"wtype\"").is_err());
+        assert_eq!(
+            Config::default().injection.method,
+            InsertMethod::InputMethod
+        );
+        let c: Config = toml::from_str("[injection]\nmethod = \"input_method\"").unwrap();
+        assert_eq!(c.injection.method, InsertMethod::InputMethod);
         let c: Config = toml::from_str("[injection]\ntype_delay_ms = 1000").unwrap();
         assert!(c.validate().is_err());
     }

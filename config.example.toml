@@ -69,16 +69,20 @@ preload = true                # load the model on the server when recording star
 # prompt_file = "/path/prompt.toml"  # replace the built-in prompt (see src/cleanup/prompt.toml)
 
 [injection]
-# When a result is ready: "insert" (copy + type into the focused field),
+# When a result is ready: "insert" (into the focused text field),
 # "copy" (clipboard only), or "none" (wait for `copy`/`insert`).
 on_ready = "insert"
-# "type": per-character virtual-keyboard typing, independent of app shortcuts.
-# "paste": send paste_chord instead (needs the right chord per app).
-method = "type"
-newline = "shift_enter"    # or "enter" (may submit/run commands) or "space"
-type_delay_ms = 2          # pause after each typed character
+# "input_method": commit the text as the seat's input method (text-input-v3
+#   apps: GTK, Qt 6, Firefox, foot, …). No keys, clipboard untouched. Without
+#   a focused text field the text is copied and waits for `toggle`/`insert`.
+#   Excludes other input methods (fcitx5, ibus) while running.
+# "type": copy, then per-character virtual-keyboard typing (any app).
+# "paste": copy, then send paste_chord (needs the right chord per app).
+method = "input_method"
+newline = "shift_enter"    # or "enter" (may submit/run commands) or "space"; input_method: only "space" differs
+type_delay_ms = 2          # method = "type": pause after each typed character
 paste_chord = "ctrl+v"     # method = "paste" only; terminals: "ctrl+shift+v"
-pre_insert_delay_ms = 150  # lets you release the keybinding that triggered insert
+pre_insert_delay_ms = 150  # type/paste: lets you release the keybinding that triggered insert
 key_delay_ms = 10
 
 [note]

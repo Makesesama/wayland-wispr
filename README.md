@@ -20,9 +20,11 @@ from a keybinding in your compositor or window manager:
    self-corrections ("at two, actually three" becomes "at three"), fixes
    punctuation and turns spoken "new line" or "Komma" into formatting. If
    the server fails, the raw transcript is used.
-4. **Insert.** The result goes to the clipboard and is typed into the focused
-   application through a virtual keyboard. Typing works with any keyboard
-   layout and doesn't depend on the application's paste shortcut.
+4. **Insert.** The result is committed into the focused text field as the
+   seat's input method, like an on-screen keyboard or IME would: one atomic
+   edit, no simulated keys, clipboard untouched. If no text field is focused,
+   the text is copied instead and waits: focus a field and press the
+   dictation key again.
 
 Recordings are never written to disk, and no network requests are made unless
 you point cleanup at a remote server. `status` never includes transcript text.
@@ -46,12 +48,13 @@ you point cleanup at a remote server. `status` never includes transcript text.
 - A Wayland compositor that provides these protocols. wlroots-based compositors
   such as river, sway and Hyprland do. **GNOME/Mutter does not.**
   - `zwlr_layer_shell_v1` for the overlay
+  - `zwp_input_method_manager_v2` for inserting text (default method)
   - `zwp_virtual_keyboard_manager_v1` for typing and paste chords
   - `ext_data_control_manager_v1` or `zwlr_data_control_manager_v1` for the
     clipboard
 
   To check your compositor, run `wayland-wispr probe` (or
-  `wayland-info | grep -E 'layer_shell|virtual_keyboard|data_control'`).
+  `wayland-info | grep -E 'layer_shell|input_method|virtual_keyboard|data_control'`).
 - PipeWire or ALSA for microphone input.
 - For GPU transcription: a Vulkan driver, e.g. `hardware.graphics.enable = true`
   on NixOS. A discrete GPU runs `large-v3-turbo` in about 0.3 s per clip.
@@ -381,9 +384,32 @@ der Amara.org-Community", are removed beforehand.
 
 ### Text insertion
 
-With the default `method = "type"`, the text is typed through
+With the default `method = "input_method"`, wayland-wispr registers as the
+seat's input method (`zwp_input_method_v2`) and commits the text to the
+focused application's `zwp_text_input_v3`.
+
+- **Only into text fields.** The compositor reports whether a text field is
+  active. If none is (desktop, a window without text input, focus moved away
+  while you were speaking), nothing is inserted: the text is copied to the
+  clipboard and the overlay shows "No text field focused". Focus a field and
+  press the dictation key (`toggle`) again to insert it, or `cancel`.
+- **Supported apps** are those speaking text-input-v3: GTK 3/4 (Firefox,
+  GNOME apps), Qt 6, foot, kitty, Alacritty, WezTerm. Chromium and Electron
+  apps (Chrome, VS Code, Discord, Slack) only do so when started with
+  `--enable-wayland-ime --wayland-text-input-version=3`; otherwise use
+  `method = "type"` (or `insert`/`copy` manually).
+- **One input method per seat.** While wayland-wispr runs, fcitx5/ibus can't
+  bind, and vice versa. If another one holds the seat, insertion fails (the
+  text is copied); the next attempt tries again.
+- **Line breaks** are committed as plain `\n`: a new line in text fields,
+  but Return in a terminal. Set `newline = "space"` if you dictate into shells.
+- **Compositors:** river relays text input with keyboard focus, so focusing
+  nothing deactivates the field. Sway keeps the last text field active when
+  you focus an empty workspace, so text can still land in that window.
+
+With `method = "type"`, the text is copied, then typed through
 `zwp_virtual_keyboard_v1` with a short-lived keymap. It types the same way in
-editors, browsers and terminals.
+editors, browsers and terminals, text field or not.
 
 - **Line breaks** are typed as Shift+Return. A terminal may still run a
   command on it, so set `newline = "space"` if you dictate into shells.
@@ -392,9 +418,10 @@ editors, browsers and terminals.
 - **`method = "paste"`** sends `paste_chord` instead. Terminals usually need
   `"ctrl+shift+v"`.
 - **The clipboard is replaced** and not restored.
-- **Success** only means the compositor received the keys. Wayland can't
-  confirm that the app inserted them. If insertion fails, the result stays
-  ready for a manual `insert` or `copy`.
+- **Success** only means the compositor received the keys (or, with the input
+  method, the text). Wayland can't confirm that the app inserted it. If
+  insertion fails, the result stays ready for `insert`, `copy`, or (after a
+  failed insert) another `toggle`.
 
 ### Themes
 
@@ -447,6 +474,7 @@ services.wayland-wispr.settings.overlay.theme = {
 | --- | --- |
 | Service doesn't start | `journalctl --user -u wayland-wispr`. Is `WAYLAND_DISPLAY` in `systemctl --user show-environment`? |
 | No overlay / nothing typed | `wayland-wispr probe`: the compositor lacks a required protocol |
+| "No text field focused" although one is | The app lacks text-input-v3 (Chromium/Electron without `--enable-wayland-ime --wayland-text-input-version=3`), or another input method holds the seat. Use `method = "type"` |
 | "no speech" | `wayland-wispr devices`, then set `audio.device`. Lower `audio.silence_threshold_dbfs` for quiet microphones. |
 | Wrong language or translated output | Set `languages = ["de", "en"]` and keep `language = "auto"` |
 | "Ready (not cleaned up)" | `wayland-wispr status` shows `cleanup_error`. Is the LLM server running and the model pulled? |
@@ -533,12 +561,12 @@ Unknown keys are errors. Relative paths are relative to the config file. Only
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `on_ready` | `"insert"` | When a result is ready: `"insert"` (copy and type), `"copy"`, or `"none"` |
-| `method` | `"type"` | `"type"` (virtual keyboard) or `"paste"` (send `paste_chord`) |
-| `newline` | `"shift_enter"` | How line breaks are typed: `"shift_enter"`, `"enter"` or `"space"` |
+| `on_ready` | `"insert"` | When a result is ready: `"insert"`, `"copy"`, or `"none"` |
+| `method` | `"input_method"` | `"input_method"` (commit to the focused text field), `"type"` (copy + virtual keyboard) or `"paste"` (copy + `paste_chord`) |
+| `newline` | `"shift_enter"` | How line breaks are typed: `"shift_enter"`, `"enter"` or `"space"`. The input method commits `\n` for the first two |
 | `type_delay_ms` | `2` | Pause after each typed character |
 | `paste_chord` | `"ctrl+v"` | With `"paste"`, e.g. `"ctrl+shift+v"` for terminals |
-| `pre_insert_delay_ms` | `150` | Time to release the triggering keybinding before typing |
+| `pre_insert_delay_ms` | `150` | `type`/`paste`: time to release the triggering keybinding before typing |
 | `key_delay_ms` | `10` | Delay after keymap changes and while a chord is held |
 
 ### `[note]`
@@ -560,10 +588,10 @@ Unknown keys are errors. Relative paths are relative to the config file. Only
 
 ```text
 wayland-wispr run                 resident process with overlay (the service runs this)
-wayland-wispr toggle              start recording / stop and process
+wayland-wispr toggle              start recording / stop and process / retry a failed insert
 wayland-wispr start | stop        push-to-talk press / release
 wayland-wispr cancel              discard recording, processing or result (alias: abort)
-wayland-wispr insert [--raw]      copy the ready result and type/paste it into the focused app
+wayland-wispr insert [--raw]      insert the ready result into the focused app
 wayland-wispr copy [--raw]        copy the ready result to the clipboard
 wayland-wispr note                like toggle, but pipe the result into note.hook
 wayland-wispr status              JSON state of the running instance (no transcript text)

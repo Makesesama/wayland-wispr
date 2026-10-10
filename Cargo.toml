@@ -13,7 +13,7 @@ glib-unix = "0.22"
 gtk4-layer-shell = "0.8"
 async-channel = "2.5"
 
-# Native Wayland protocol access on a separate connection (pure-Rust backend,
+# Native Wayland protocol access on separate connections (pure-Rust backend,
 # so it does not interfere with gtk4-layer-shell's libwayland link order).
 wayland-client = "0.31"
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
@@ -39,7 +39,7 @@ ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # Local transcription (whisper.cpp). CPU by default; GPU backends via features.
 # raw-api: ggml device registry + encoder-begin callback (see transcription/whisper.rs).
 whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend", "raw-api"] }
-rustix = { version = "1.1", features = ["net", "process", "fs", "time"] }
+rustix = { version = "1.1", features = ["net", "process", "fs", "time", "event"] }
 
 [features]
 default = ["local-whisper"]
